@@ -6,9 +6,9 @@ endif
 
 all:
 ifeq ($(detected_OS),Darwin)
-		gcc main.c patchfinder64.c newpatch.c decoders.c instructions.c -Iinclude -o kairos
+		gcc main.c watchimage.c watchpatch.c watchoptions.c patchfinder64.c newpatch.c decoders.c instructions.c -Iinclude -o kairos
 else
-		gcc main.c patchfinder64.c newpatch.c decoders.c instructions.c -Iinclude -DNOT_DARWIN -o kairos
+		gcc main.c watchimage.c watchpatch.c watchoptions.c patchfinder64.c newpatch.c decoders.c instructions.c -Iinclude -DNOT_DARWIN -o kairos
 endif
 clean:
 ifeq ($(detected_OS),Windows)

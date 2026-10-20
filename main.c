@@ -20,6 +20,9 @@
 */
 
 #include "newpatch.h"
+#include "watchoptions.h"
+#include "watchpatch.h"
+#include <errno.h>
 
 int main(int argc, char* argv[]) {
 	if(argc < 3) {
@@ -41,17 +44,24 @@ int main(int argc, char* argv[]) {
 	memset(&iboot_in, 0, sizeof(iboot_in));
 	bool doNvramUnlock = false;
 
-	if(argc > 3) {
-		for(int i = 1; i < argc; i++) {
-			if(strncmp(argv[i],"-b",2) == 0) // user set boot-args
-				bootArgs = argv[i+1];
-			if(strncmp(argv[i],"-c",2) == 0) { // user wants to set command handler location
-				command_str = argv[i+1];
-				sscanf(argv[i+2], "0x%016llX", &command_ptr);
+	for(int i = 3; i < argc; i++) {
+		if(!strcmp(argv[i], "-b") && i + 1 < argc) {
+			bootArgs = argv[++i];
+		} else if(!strcmp(argv[i], "-c") && i + 2 < argc) {
+			command_str = argv[++i];
+			char* end;
+			const char* address = argv[++i];
+			errno = 0;
+			command_ptr = strtoull(address, &end, 0);
+			if(errno || end == address || *end || address[0] == '-' || !command_ptr) {
+				WARN("Invalid command handler address: %s\n", address);
+				return 1;
 			}
-			if(strncmp(argv[i],"-n",2) == 0) {
-				doNvramUnlock = true;
-			}
+		} else if(!strcmp(argv[i], "-n")) {
+			doNvramUnlock = true;
+		} else {
+			WARN("Unknown option or missing argument: %s\n", argv[i]);
+			return 1;
 		}
 	}
 	// read in image
@@ -60,22 +70,71 @@ int main(int argc, char* argv[]) {
 		printf("Error opening %s for reading\n",inFile);
 		return -1;
 	}
-	fseek(fp,0,SEEK_END);
-	iboot_in.len = ftell(fp);
-	fseek(fp,0,SEEK_SET);
-	iboot_in.buf = (uint8_t*)malloc(iboot_in.len);
+	if(fseek(fp, 0, SEEK_END)) {
+		fclose(fp);
+		return 1;
+	}
+	long file_size = ftell(fp);
+	if(file_size < 0x340 || fseek(fp, 0, SEEK_SET)) {
+		WARN("Input is too short to be an unpacked iBoot image\n");
+		fclose(fp);
+		return 1;
+	}
+	iboot_in.len = (size_t)file_size;
+	iboot_in.buf = malloc(iboot_in.len);
 	if(!iboot_in.buf) {
-		printf("Error allocating 0x%lx bytes\n",iboot_in.len);
+		fclose(fp);
+		return 1;
+	}
+	if(fread(iboot_in.buf, 1, iboot_in.len, fp) != iboot_in.len) {
+		WARN("Could not read the complete input image\n");
+		free(iboot_in.buf);
+		fclose(fp);
+		return 1;
+	}
+	fclose(fp);
+	LOG("Patching %s\n",inFile);
+	if(has_magic(iboot_in.buf)) {
+		WARN("%s does not appear to be stripped\n",inFile);
+		free(iboot_in.buf);
 		return -1;
 	}
-	fread(iboot_in.buf,1,iboot_in.len,fp);
-	fflush(fp);
-	fclose(fp);
-	// patch
-	LOG("Patching %s\n",inFile);
-	if(has_magic(iboot_in.buf)) { // make sure we aren't dealing with a packed IMG4 container
-		WARN("%s does not appear to be stripped\n",inFile);
-		return -1;
+	uint32_t reset;
+	memcpy(&reset, iboot_in.buf, sizeof(reset));
+	uint32_t base;
+	if(watch_image_info(iboot_in.buf, iboot_in.len, &base)) {
+		iboot_in.base = base;
+		get_iboot64_version(&iboot_in);
+		LOG("ARMv7 Thumb Watch bootloader, base 0x%08x, iBoot-%u.%u\n", base, iboot_in.VERS,
+			iboot_in.minor_vers);
+		ret = watch_sigcheck_patch(&iboot_in);
+		if(ret < 0)
+			goto patch_failed;
+		if(has_kernel_load_k(&iboot_in)) {
+			if(bootArgs && watch_bootargs_patch(&iboot_in, bootArgs) < 0) {
+				WARN("Failed to patch Thumb boot arguments\n");
+				goto patch_failed;
+			}
+			if(watch_debug_patch(&iboot_in) < 0)
+				WARN("Could not enable Thumb kernel debug\n");
+		}
+		if(has_recovery_console_k(&iboot_in)) {
+			if(command_str && watch_command_patch(&iboot_in, command_str, command_ptr) < 0) {
+				WARN("Failed to patch Thumb command handler\n");
+				goto patch_failed;
+			}
+			if(doNvramUnlock && watch_nvram_patch(&iboot_in) < 0) {
+				WARN("Failed to unlock Thumb NVRAM\n");
+				goto patch_failed;
+			}
+		}
+		goto write_output;
+	}
+	if((reset & 0xff000000) == 0xea000000 ||
+		!memcmp((uint8_t *)iboot_in.buf + 4, "\x18\xf0\x9f\xe5", 4) ||
+		!get_iboot64_version(&iboot_in)) {
+		WARN("Unsupported or invalid unpacked bootloader\n");
+		goto patch_failed;
 	}
 	LOG("Base address: 0x%llx\n",get_iboot64_base_address(&iboot_in));
     bool pac = iboot64_pac_check(&iboot_in);
@@ -109,7 +168,9 @@ int main(int argc, char* argv[]) {
 	LOG("Patching out RSA signature check...\n");
 	ret = rsa_sigcheck_patch(&iboot_in, pac);
 	if(ret < 0)
-		WARN("Error patching out RSA signature check\n");
+		goto patch_failed;
+
+write_output:
 	// now write file
 	fp = fopen(outFile,"wb+");
 	if(!fp) {
@@ -117,10 +178,23 @@ int main(int argc, char* argv[]) {
 		free(iboot_in.buf);
 		return -1;
 	}
-	fwrite(iboot_in.buf,1,iboot_in.len,fp);
-	fflush(fp);
-	fclose(fp);
+	if(fwrite(iboot_in.buf, 1, iboot_in.len, fp) != iboot_in.len || fflush(fp)) {
+		WARN("Error writing %s\n", outFile);
+		fclose(fp);
+		free(iboot_in.buf);
+		return 1;
+	}
+	if(fclose(fp)) {
+		WARN("Error closing %s\n", outFile);
+		free(iboot_in.buf);
+		return 1;
+	}
 	free(iboot_in.buf);
 	LOG("Wrote patched image to %s\n",outFile);
 	return 0;
+
+patch_failed:
+	WARN("Patching failed; output was not written\n");
+	free(iboot_in.buf);
+	return 1;
 }

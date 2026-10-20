@@ -45,7 +45,7 @@ void *memmem(const void *haystack, size_t haystack_len,
 /* begin functions from iBoot32Patcher by iH8sn0w*/
 bool has_magic(uint8_t* buf) {
 	uint32_t magic;
-	magic = *(uint32_t*)(buf+7);
+	memcpy(&magic, buf + 7, sizeof(magic));
 	if(memcmp(&magic,IMAGE4_MAGIC,4) == 0) {
 		return true;
 	}
@@ -90,21 +90,23 @@ uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in) {  // modified f
 /* end functions from iBoot32Patcher */
 
 uint32_t get_iboot64_version(struct iboot64_img* iboot_in) {
-	void* versionString = memmem(iboot_in->buf,iboot_in->len,"iBoot-",strlen("iBoot-"));
-	if(!versionString) {
+	const char* version = memmem(iboot_in->buf, iboot_in->len, "iBoot-", 6);
+	iboot_in->VERS = 0;
+	iboot_in->minor_vers = 0;
+	if(!version)
 		return 0;
-	}
-	char vers[5];
-	// get major version
-	strncpy(vers,versionString+6,4);
-	iboot_in->VERS = atoi(vers);
-	// get minor version
-	memset(vers,'\0',5);
-	strncpy(vers,versionString+11,4);
-	char* period_loc = strchr(vers,'.');
-	*period_loc = '\0';
-	iboot_in->minor_vers = atoi(vers);
-	return iboot_in->VERS; // return major version
+	size_t offset = (const uint8_t *)version - (const uint8_t *)iboot_in->buf + 6;
+	char text[64] = {0};
+	size_t count = iboot_in->len - offset;
+	if(count >= sizeof(text))
+		count = sizeof(text) - 1;
+	memcpy(text, (const uint8_t *)iboot_in->buf + offset, count);
+	unsigned major = 0, minor = 0;
+	if(sscanf(text, "%u.%u", &major, &minor) < 1)
+		return 0;
+	iboot_in->VERS = major;
+	iboot_in->minor_vers = minor;
+	return major;
 }
 
 uint64_t iboot64_ref(struct iboot64_img* iboot_in, void* pat) {

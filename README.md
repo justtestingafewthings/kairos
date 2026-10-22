@@ -2,7 +2,7 @@ kairos
 ======
 kairos is an iBoot image patcher written in C.
 
-Support for iOS 7 - 15 and watchOS 1 - 8.
+Support for iOS 7 - 18, watchOS 1 - 8, and tvOS 9 - 26.
 
 Patches include:
 * RSA signature check removal

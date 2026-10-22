@@ -137,32 +137,38 @@ int main(int argc, char* argv[]) {
 		goto patch_failed;
 	}
 	LOG("Base address: 0x%llx\n",get_iboot64_base_address(&iboot_in));
-    bool pac = iboot64_pac_check(&iboot_in);
+	bool pac = iboot64_pac_check(&iboot_in);
 	if(has_kernel_load_k(&iboot_in)) {
 		LOG("Does have kernel load\n");
 		if(bootArgs) {
 			LOG("Patching boot-args...\n");
 			ret = patch_boot_args64(&iboot_in,bootArgs);
-			if (ret < 0)
+			if(ret < 0) {
 				WARN("Failed to patch boot-args\n");
+				goto patch_failed;
+			}
 		}
 		LOG("Enabling kernel debug...\n");
 		ret = enable_kernel_debug(&iboot_in);
-		if(ret < 0) // won't fail because it is not fatal, but it would really be nice if we had k-debug
+		if(ret < 0)
 			WARN("Could not enable kernel debug\n");
 	}
 	if(has_recovery_console_k(&iboot_in)) {
 		if(command_str && (command_ptr != 0)) { // need to reassign command handler
 			LOG("Changing command handler %s to 0x%llx...\n",command_str,command_ptr);
 			ret = do_command_handler_patch(&iboot_in,command_str,command_ptr);
-			if(ret < 0) // do not exit, just continue without cmdhandler patch
+			if(ret < 0) {
 				WARN("Failed to patch command handler for %s\n",command_str);
+				goto patch_failed;
+			}
 		}
 		if(doNvramUnlock) {
 			LOG("Unlocking nvram...\n");
 			ret = unlock_nvram(&iboot_in);
-			if(ret < 0)
+			if(ret < 0) {
 				WARN("Failed to unlock nvram\n");
+				goto patch_failed;
+			}
 		}
 	}
 	LOG("Patching out RSA signature check...\n");

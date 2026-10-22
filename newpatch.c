@@ -42,6 +42,324 @@ void *memmem(const void *haystack, size_t haystack_len,
 }
 #endif
 
+static uint32_t a64_word(const struct iboot64_img* image, size_t p) {
+	uint32_t value;
+	memcpy(&value, (const uint8_t *)image->buf + p, sizeof(value));
+	return value;
+}
+
+static uint64_t a64_pointer(const struct iboot64_img* image, size_t p) {
+	uint64_t value;
+	memcpy(&value, (const uint8_t *)image->buf + p, sizeof(value));
+	return value;
+}
+
+static int64_t a64_signed(uint32_t value, unsigned bits) {
+	return (int64_t)(value & ((1u << bits) - 1)) -
+		((value & (1u << (bits - 1))) ? (1LL << bits) : 0);
+}
+
+static int a64_address(const struct iboot64_img* image, size_t p,
+	unsigned* reg, size_t* address, size_t* width) {
+	if(p > image->len || image->len - p < 4)
+		return 0;
+	uint32_t op = a64_word(image, p);
+	int64_t displacement = a64_signed(((op >> 5) & 0x7ffff) << 2 |
+		((op >> 29) & 3), 21), target;
+	*reg = op & 31;
+	*width = 4;
+	if((op & 0x9f000000) == 0x10000000) {
+		target = (int64_t)p + displacement;
+	} else if((op & 0x9f000000) == 0x90000000 && image->len - p >= 8) {
+		uint32_t add = a64_word(image, p + 4);
+		if((add & 0xffc00000) != 0x91000000 ||
+			((add >> 5) & 31) != *reg || (add & 31) != *reg)
+			return 0;
+		target = (int64_t)((image->base + p) & ~(uint64_t)0xfff) -
+			(int64_t)image->base + displacement * 4096 + ((add >> 10) & 0xfff);
+		*width = 8;
+	} else {
+		return 0;
+	}
+	if(*reg == 31 || target < 0 || (uint64_t)target >= image->len)
+		return 0;
+	*address = (size_t)target;
+	return 1;
+}
+
+static size_t a64_xref(const struct iboot64_img* image, size_t target) {
+	for(size_t p = 0; p + 4 <= image->len; p += 4) {
+		unsigned reg;
+		size_t address, width;
+		if(a64_address(image, p, &reg, &address, &width) && address == target)
+			return p;
+	}
+	return 0;
+}
+
+static int a64_prologue(uint32_t op) {
+	return (op & 0xffc003ff) == 0xd10003ff || // SUB SP,SP,#imm
+		(op & 0xffc003e0) == 0xa98003e0; // STP Xn,Xm,[SP,#-imm]!
+}
+
+static size_t a64_function(const struct iboot64_img* image, size_t ref) {
+	if(ref >= image->len || (ref & 3))
+		return 0;
+	size_t limit = ref > 0x2000 ? ref - 0x2000 : 0x340;
+	for(size_t p = ref; p >= limit && p >= 0x340; p -= 4) {
+		if((a64_word(image, p) & 0xffc003ff) != 0x910003fd)
+			continue; // ADD X29,SP,#imm
+		for(size_t q = p; q >= 0x344 && p - q < 128; q -= 4)
+			if(a64_prologue(a64_word(image, q - 4))) {
+				size_t start = q - 4;
+				if(start >= 4 && a64_word(image, start - 4) == 0xd503237f)
+					start -= 4; // Include PACIBSP.
+				return start;
+			}
+		return 0;
+	}
+	return 0;
+}
+
+static int a64_tag(const struct iboot64_img* image, size_t start,
+	size_t end, uint32_t tag) {
+	for(size_t p = start; p + 8 <= end; p += 4) {
+		uint32_t a = a64_word(image, p), z = a64_word(image, p + 4);
+		if((a & 0xffe00000) == 0x52800000 &&
+			(z & 0xffe0001f) == (0x72a00000 | (a & 31)) &&
+			((a >> 5) & 0xffff) == (tag & 0xffff) &&
+			((z >> 5) & 0xffff) == (tag >> 16))
+			return 1;
+	}
+	return 0;
+}
+
+static int a64_sigcheck(struct iboot64_img* image) {
+	size_t selected = 0;
+	for(size_t p = 0x340; p + 4 <= image->len; p += 4) {
+		unsigned reg;
+		size_t table, width;
+		if(!a64_address(image, p, &reg, &table, &width) || reg != 2 ||
+			(table & 7) || image->len - table < 24 || a64_pointer(image, table + 16))
+			continue;
+		uint64_t pointer = a64_pointer(image, table), next = a64_pointer(image, table + 8);
+		if(pointer < image->base || pointer - image->base >= image->len ||
+			next < image->base || next - image->base >= image->len || (pointer & 3) || (next & 3))
+			continue;
+		size_t callback = (size_t)(pointer - image->base);
+		if(image->len - callback < 8 ||
+			(!a64_prologue(a64_word(image, callback)) && a64_word(image, callback) != 0xd503237f))
+			continue;
+		size_t end = (size_t)(next - image->base);
+		if(end <= callback || end - callback > 0x2000)
+			continue;
+		if(!a64_tag(image, callback, end, 0x454b4559) || // EKEY
+			!a64_tag(image, callback, end, 0x414d4e4d) || // AMNM
+			!a64_tag(image, callback, end, 0x424f5244)) // BORD
+			continue;
+		int stack_context = 0, call = 0;
+		for(size_t q = p + width; q + 4 <= image->len && q < p + width + 32; q += 4) {
+			uint32_t op = a64_word(image, q);
+			if((op & 0xffc003ff) == 0x910003e4)
+				stack_context = 1; // ADD X4,SP,#context
+			if((op & 0xfc000000) == 0x94000000) {
+				call = 1;
+				break;
+			}
+		}
+		if(!stack_context || !call)
+			continue;
+		if(selected && selected != callback) {
+			WARN("Ambiguous ARM64 IMG4 property callback\n");
+			return -1;
+		}
+		selected = callback;
+	}
+	if(!selected) {
+		WARN("Could not validate ARM64 IMG4 property callback\n");
+		return -1;
+	}
+	write_opcode(image->buf, selected, 0xd2800000); // MOV X0,#0
+	write_opcode(image->buf, selected + 4, 0xd65f03c0); // RET
+	LOG("Patched ARM64 IMG4 property callback at 0x%zx\n", selected);
+	return 0;
+}
+
+static int a64_bootargs_context(const struct iboot64_img* image, size_t copy) {
+	const uint8_t* b = image->buf;
+	size_t restore = 0, ramdisk = 0;
+	size_t start = copy > 0x800 ? copy - 0x800 : 0x340;
+	for(size_t p = start; p < copy; p += 4) {
+		unsigned reg;
+		size_t target, width;
+		if(!a64_address(image, p, &reg, &target, &width))
+			continue;
+		if(reg == 4 && image->len - target >= 6 && !memcmp(b + target, "rd=md0", 6))
+			ramdisk = p;
+		if(reg == 1 && image->len - target >= 10 && !memcmp(b + target, " -restore\0", 10))
+			restore = p;
+	}
+	size_t function = a64_function(image, copy);
+	return ramdisk && restore > ramdisk && function &&
+		a64_function(image, ramdisk) == function && a64_function(image, restore) == function;
+}
+
+static int a64_bootargs(struct iboot64_img* image, const char* args) {
+	const uint8_t* b = image->buf;
+	size_t length = strlen(args), selected = 0, selected_width = 0;
+	if(length > 270) {
+		WARN("Boot arguments exceed 270 bytes\n");
+		return -1;
+	}
+	for(size_t p = 0x340; p + 12 <= image->len; p += 4) {
+		unsigned reg;
+		size_t target, width;
+		if(!a64_address(image, p, &reg, &target, &width) || reg != 4 ||
+			image->len - target < 3 || memcmp(b + target, "%s\0", 3))
+			continue;
+		size_t store = p + width;
+		if(a64_word(image, store) == 0xd503201f)
+			store += 4;
+		if(store + 12 > image->len ||
+			(a64_word(image, store) & 0xffffffe0) != 0xf90003e0)
+			continue; // STR Xn,[SP]
+		size_t call = store + 4;
+		if((a64_word(image, call) & 0xffe0ffff) == 0xaa0003e0)
+			call += 4; // MOV X0,Xn
+		if((a64_word(image, call) & 0xfc000000) != 0x94000000)
+			continue;
+		if(!a64_bootargs_context(image, p))
+			continue;
+		if(selected) {
+			WARN("Ambiguous ARM64 boot-args formatting call\n");
+			return -1;
+		}
+		selected = p;
+		selected_width = width;
+	}
+	if(!selected) {
+		WARN("Could not validate ARM64 boot-args formatting call\n");
+		return -1;
+	}
+	char format[541];
+	size_t used = 0;
+	for(size_t i = 0; i < length; i++) {
+		format[used++] = args[i];
+		if(args[i] == '%')
+			format[used++] = '%'; // Escape format specifiers.
+	}
+	format[used++] = 0;
+	size_t run = 0, storage = 0, reserve = used < 270 ? 270 : used;
+	for(size_t p = 0x340; p < image->len; p++) {
+		if(!b[p]) {
+			run++;
+			continue;
+		}
+		if(!(p & 0x7ff) && run >= 512 && run >= reserve + 32) { // 2 KiB alignment
+			storage = p - reserve - 16;
+			break;
+		}
+		run = 0;
+	}
+	if(!storage || (int64_t)storage - (int64_t)selected < -(1LL << 20) ||
+		(int64_t)storage - (int64_t)selected >= (1LL << 20)) {
+		WARN("No reachable padding for ARM64 boot arguments\n");
+		return -1;
+	}
+	memcpy((uint8_t *)image->buf + storage, format, used);
+	write_opcode(image->buf, selected, new_insn_adr(selected, 4, storage));
+	if(selected_width == 8)
+		write_opcode(image->buf, selected + 4, 0xd503201f);
+	LOG("Patched ARM64 boot-args format at 0x%zx, string at 0x%zx\n", selected, storage);
+	return 0;
+}
+
+static int a64_debug(struct iboot64_img* image) {
+	const uint8_t* b = image->buf;
+	size_t selected = 0;
+	for(size_t p = 0x340; p + 4 <= image->len; p += 4) {
+		unsigned reg;
+		size_t target, width;
+		if(!a64_address(image, p, &reg, &target, &width) ||
+			image->len - target < 14 || memcmp(b + target, "debug-enabled\0", 14))
+			continue;
+		unsigned calls = 0;
+		for(size_t q = p + width; q + 8 <= image->len && q < p + width + 48; q += 4) {
+			uint32_t op = a64_word(image, q);
+			if(op == 0xd65f03c0 || (op & 0xfc000000) == 0x14000000)
+				break;
+			if((op & 0xfc000000) != 0x94000000 || ++calls != 2)
+				continue;
+			uint32_t branch = a64_word(image, q + 4);
+			if((branch & 0x7e00001f) != 0x34000000)
+				break; // CBZ/CBNZ W0 or X0
+			if(selected && selected != q)
+				return -1;
+			selected = q;
+			break;
+		}
+	}
+	if(!selected) {
+		WARN("Could not validate ARM64 debug permission call\n");
+		return -1;
+	}
+	write_opcode(image->buf, selected, 0xd2800020); // MOV X0,#1
+	LOG("Patched ARM64 debug permission call at 0x%zx\n", selected);
+	return 0;
+}
+
+static int a64_nvram(struct iboot64_img* image) {
+	const uint8_t* b = image->buf;
+	const char name[] = "debug-uarts";
+	size_t functions[3] = {0};
+	for(size_t p = 0; p + 8 <= image->len; p += 8) {
+		uint64_t pointer = a64_pointer(image, p);
+		if(pointer < image->base || pointer - image->base >= image->len)
+			continue;
+		size_t s = pointer - image->base;
+		if(image->len - s < sizeof(name) || memcmp(b + s, name, sizeof(name)))
+			continue;
+		size_t start = p, end = p;
+		while(start >= 8 && p - start < 2048 && a64_pointer(image, start - 8))
+			start -= 8;
+		if(start < 8 || a64_pointer(image, start - 8))
+			continue;
+		while(end + 16 <= image->len && end - p < 2048 && a64_pointer(image, end))
+			end += 8;
+		if(end + 16 > image->len || a64_pointer(image, end))
+			continue;
+		size_t first = a64_function(image, a64_xref(image, start));
+		size_t second = a64_function(image, a64_xref(image, end + 8));
+		if(!first || !second || first == second)
+			continue;
+		if(functions[0] && (functions[0] != first || functions[1] != second))
+			return -1;
+		functions[0] = first;
+		functions[1] = second;
+	}
+	const char system[] = "com.apple.System.";
+	for(size_t p = 0; p + sizeof(system) <= image->len; p++) {
+		if(memcmp(b + p, system, sizeof(system)))
+			continue;
+		size_t ref = a64_xref(image, p), function = a64_function(image, ref);
+		if(functions[2] && function && functions[2] != function)
+			return -1;
+		if(function)
+			functions[2] = function;
+	}
+	for(size_t i = 0; i < 3; i++)
+		if(!functions[i] || image->len - functions[i] < 8)
+			return -1;
+	if(functions[0] == functions[1] || functions[0] == functions[2] || functions[1] == functions[2])
+		return -1;
+	for(size_t i = 0; i < 3; i++) {
+		write_opcode(image->buf, functions[i], 0xd2800000);
+		write_opcode(image->buf, functions[i] + 4, 0xd65f03c0);
+		LOG("Patched ARM64 NVRAM restriction at 0x%zx\n", functions[i]);
+	}
+	return 0;
+}
+
 /* begin functions from iBoot32Patcher by iH8sn0w*/
 bool has_magic(uint8_t* buf) {
 	uint32_t magic;
@@ -111,9 +429,11 @@ uint32_t get_iboot64_version(struct iboot64_img* iboot_in) {
 
 uint64_t iboot64_ref(struct iboot64_img* iboot_in, void* pat) {
 	uint64_t new_pat = (uintptr_t) GET_IBOOT64_ADDR(iboot_in, pat);
+	if(iboot_in->VERS >= 7429)
+		return a64_xref(iboot_in, new_pat - iboot_in->base);
 	addr_t ref = xref64(iboot_in->buf,0,iboot_in->len,new_pat-iboot_in->base);
 	if(!ref) {
-		return -1;
+		return 0;
 	}
 	return ref;
 }
@@ -373,6 +693,8 @@ void do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, bool p
 }
 
 int patch_boot_args64(struct iboot64_img* iboot_in, char* bootargs) {
+	if(iboot_in->VERS >= 7429)
+		return a64_bootargs(iboot_in, bootargs);
 	// find current boot-args
 	void* default_loc = NULL;
 	int num = 1;
@@ -446,6 +768,8 @@ int patch_boot_args64(struct iboot64_img* iboot_in, char* bootargs) {
 }
 
 int enable_kernel_debug(struct iboot64_img* iboot_in) {
+	if(iboot_in->VERS >= 7429)
+		return a64_debug(iboot_in);
 	void* debugLoc = NULL;
 	debugLoc = memmem(iboot_in->buf,iboot_in->len,"debug-enabled",strlen("debug-enabled"));
 	if(!debugLoc) {
@@ -466,6 +790,8 @@ int enable_kernel_debug(struct iboot64_img* iboot_in) {
 }
 
 int rsa_sigcheck_patch(struct iboot64_img* iboot_in, bool pac) {
+	if(iboot_in->VERS >= 7429)
+		return a64_sigcheck(iboot_in);
 	void* img4Loc = NULL;
 	img4Loc = memmem(iboot_in->buf,iboot_in->len,"IMG4\0",5);
 	if(!img4Loc) {
@@ -504,6 +830,16 @@ int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintpt
 		return -1;
 	}
 	addr_t ref = (addr_t)GET_IBOOT_FILE_OFFSET(iboot_in,cmdRef);
+	if((ref & 7) || ref > iboot_in->len || iboot_in->len - ref < 16) {
+		WARN("Invalid command table entry\n");
+		return -1;
+	}
+	uint64_t handler = a64_pointer(iboot_in, ref + 8);
+	if((handler & 3) || handler < iboot_in->base ||
+		handler - iboot_in->base >= iboot_in->len || (ptr & 3)) {
+		WARN("Invalid ARM64 command handler\n");
+		return -1;
+	}
 	LOG("Found reference to %s command at 0x%llx\n",command,ref);
 	// now do patch
 	LOG("Pointing %s to 0x%lx\n",command,ptr);
@@ -512,6 +848,8 @@ int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintpt
 }
 
 int unlock_nvram(struct iboot64_img* iboot_in) {
+	if(iboot_in->VERS >= 7429)
+		return a64_nvram(iboot_in);
 	void* debuguartLoc = memmem(iboot_in->buf,iboot_in->len,"debug-uarts",strlen("debug-uarts"));
 	if(!debuguartLoc) {
 		WARN("Unable to find debug-uarts string\n");

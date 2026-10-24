@@ -451,12 +451,56 @@ int watch_command_patch(struct iboot64_img* img, const char* command, uint64_t t
 	return 0;
 }
 
+static size_t command_handler(const struct iboot64_img* img, const char* command) {
+	size_t text = find_string(img, command), selected = SIZE_MAX;
+	if(text == SIZE_MAX)
+		return SIZE_MAX;
+	for(size_t p = 0; p + 12 <= img->len; p += 4) {
+		if(rd32(img, p) != img->base + text)
+			continue;
+		uint32_t handler = rd32(img, p + 4), description = rd32(img, p + 8);
+		if(!(handler & 1) || (handler & ~1U) < img->base ||
+			(handler & ~1U) - img->base >= img->len || description < img->base ||
+			description - img->base >= img->len)
+			continue;
+		if(selected != SIZE_MAX)
+			return SIZE_MAX;
+		selected = (handler & ~1U) - img->base;
+	}
+	return selected;
+}
+
+// Development consoles may enforce only the com.apple.System namespace guard.
+static int unrestricted_setenv(const struct iboot64_img* img, size_t namespace_check) {
+	size_t handler = command_handler(img, "setenv");
+	if(handler == SIZE_MAX)
+		return 0;
+	size_t end = handler + 0x180;
+	if(end < handler || end > img->len)
+		end = img->len;
+	int namespace_seen = 0;
+	for(size_t p = handler; p + 4 <= end; p += 2) {
+		if(!is_bl(img, p))
+			continue;
+		size_t target = bl_target(img, p);
+		if(target == namespace_check) {
+			namespace_seen = 1;
+			continue;
+		}
+		if(namespace_seen && p >= 2 && rd16(img, p - 2) == 0x2101 &&
+			target != SIZE_MAX && target + 4 <= img->len &&
+			rd16(img, target) == 0x2000 && rd16(img, target + 2) == 0x4770)
+			return 1;
+	}
+	return 0;
+}
+
 int watch_nvram_patch(struct iboot64_img* img) {
 	size_t str = find_string(img, "debug-uarts");
 	if(str == SIZE_MAX)
 		return -1;
 	size_t funcs[3], count = 0;
-	int legacy_shared_list = 0;
+	int legacy_shared_list = 0, shared_policy_list = 0;
 
 	for(size_t p = 4; p + 4 <= img->len; p += 4) {
 		if(rd32(img, p) != img->base + str)
@@ -489,9 +533,22 @@ int watch_nvram_patch(struct iboot64_img* img) {
 				matches = 0;
 		}
 		legacy_shared_list |= matches;
+		static const char* const policy[] = {
+			"boot-args", "com.apple.System.boot-nonce", "debug-uarts"
+		};
+		unsigned found = 0;
+		for(size_t q = start; q + 4 <= img->len && q < start + 256; q += 4) {
+			uint32_t value = rd32(img, q);
+			if(!value)
+				break;
+			for(size_t j = 0; j < sizeof(policy) / sizeof(policy[0]); j++) {
+				size_t text = find_string(img, policy[j]);
+				if(text != SIZE_MAX && value == img->base + text)
+					found |= 1u << j;
+			}
+		}
+		shared_policy_list |= found == (1u << (sizeof(policy) / sizeof(policy[0]))) - 1;
 	}
-	if(count != 2 && !(count == 1 && legacy_shared_list))
-		return -1;
 	size_t system = find_string(img, "com.apple.System."), l;
 	unsigned reg;
 	size_t x = ref(img, system, 0, &reg, &l);
@@ -499,6 +556,10 @@ int watch_nvram_patch(struct iboot64_img* img) {
 		return -1;
 	size_t namespace_check = function_start(img, x);
 	if(namespace_check == SIZE_MAX)
+		return -1;
+	int namespace_only = count == 0 && unrestricted_setenv(img, namespace_check);
+	if(count != 2 && !(count == 1 && (legacy_shared_list || shared_policy_list)) &&
+		!namespace_only)
 		return -1;
 	funcs[count++] = namespace_check;
 	for(size_t i = 0; i < count; i++) {

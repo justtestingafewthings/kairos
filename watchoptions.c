@@ -259,11 +259,84 @@ static int split_bootargs_patch(struct iboot64_img* img, const char* args) {
 	return 0;
 }
 
+// Patch kernel handoff arguments because bootx skips the upgrade command's builder.
+static int kernel_bootargs_patch(struct iboot64_img* img, const char* args,
+	size_t dest, size_t capacity) {
+	size_t format = find_string(img, "%s force-usb-power=1 ");
+	size_t plain = find_string(img, "%s "), bootargs = find_string(img, "boot-args");
+	if(format == SIZE_MAX || plain == SIZE_MAX || bootargs == SIZE_MAX || dest == SIZE_MAX)
+		return -1;
+	size_t selected = SIZE_MAX, selected_pool = SIZE_MAX, selected_format = SIZE_MAX;
+	for(size_t q = 0x344; q + 28 <= img->len; q += 2) {
+		unsigned reg, first_reg;
+		size_t pool = literal(img, q, &reg), first = literal(img, q - 2, &first_reg);
+		if(pool == SIZE_MAX || first == SIZE_MAX || reg != first_reg ||
+			rd32(img, pool) != img->base + format || rd32(img, first) != img->base + plain ||
+			(rd16(img, q - 4) != 0xbf0c && rd16(img, q - 4) != 0xbf14))
+			continue;
+		for(size_t x = q > 0x3a0 ? q - 96 : 0x340; x + 8 <= q; x += 2) {
+			uint16_t load = rd16(img, x), cmp = rd16(img, x + 2), mov = rd16(img, x + 6);
+			unsigned dst = (load >> 8) & 7, src = (cmp >> 8) & 7, unused;
+			size_t empty = literal(img, x, &unused);
+			if((load & 0xf800) != 0x4800 || (cmp & 0xf8ff) != 0x2800 ||
+				rd16(img, x + 4) != 0xbf18 || mov != (0x4600 | src << 3 | dst) ||
+				empty == SIZE_MAX || rd32(img, empty) < img->base ||
+				rd32(img, empty) - img->base >= img->len ||
+				((const uint8_t *)img->buf)[rd32(img, empty) - img->base])
+				continue;
+			int compact = reg == 2 && rd32(img, q + 2) == 0x0048f106 &&
+				rd32(img, q + 6) == 0x7180f44f && rd16(img, q + 10) == (0x4603 | dst << 3) &&
+				(is_bl(img, q + 12) || (rd16(img, q + 12) == 0x4635 && is_bl(img, q + 14)));
+			int stacked = reg == 0 && rd32(img, q + 2) == 0x7180f44f &&
+				rd16(img, q + 6) == 0x2200 && rd16(img, q + 8) == 0xe88d &&
+				rd16(img, q + 10) == (1u | 1u << dst) && rd32(img, q + 12) == 0x0038f106 &&
+				rd32(img, q + 16) == 0x7382f44f && is_bl(img, q + 20);
+			int paired = reg == 0 && rd16(img, q + 2) == 0x2200 &&
+				rd32(img, q + 4) == 0x7380f44f && rd16(img, q + 8) == 0xe9cd &&
+				rd16(img, q + 10) == dst << 8 && (rd16(img, q + 12) & 0xff00) == 0x9900 &&
+				rd32(img, q + 14) == 0x0038f101 && rd16(img, q + 18) == 0x460d &&
+				rd32(img, q + 20) == 0x7180f44f && is_bl(img, q + 24);
+			if(!compact && !stacked && !paired)
+				continue;
+			if(x < 0x380)
+				continue;
+			size_t call = src == 0 ? x - 4 : x - 16;
+			if(!is_bl(img, call) || (src != 0 && rd16(img, x - 12) != (0x4600 | src)))
+				continue;
+			int lookup = 0;
+			for(size_t p = x - 64; p < call; p += 2) {
+				size_t l = literal(img, p, &unused);
+				if(l != SIZE_MAX && unused == 0 && rd32(img, l) == img->base + bootargs)
+					lookup = 1;
+			}
+			if(!lookup)
+				continue;
+			if(selected != SIZE_MAX)
+				return -1;
+			selected = x;
+			selected_pool = empty;
+			selected_format = q;
+		}
+	}
+	if(selected == SIZE_MAX || strlen(args) > capacity)
+		return -1;
+	memcpy((uint8_t *)img->buf + dest, args, strlen(args) + 1);
+	wr32(img, selected_pool, (uint32_t)(img->base + dest));
+	wr16(img, selected + 4, 0xbf00);
+	wr16(img, selected + 6, 0xbf00);
+	LOG("Set kernel Thumb boot arguments at 0x%zx (selector 0x%zx, literal 0x%zx, formatter 0x%zx)\n",
+		dest, selected, selected_pool, selected_format);
+	return 0;
+}
+
 int watch_bootargs_patch(struct iboot64_img* img, const char* args) {
+	// Unified loaders without certificate text can reuse a fatal diagnostic string.
+	static const char diagnostic[] = "%s:%d assert failed:seems like nand might not have enough space to accomodate exported capacity \n";
 	static const char storage[] = "Reliance on this certificate by any party assumes acceptance of "
 		"the then applicable standard terms and conditions of use, "
 		"certificate policy and certification practice statements.";
 	size_t dest = SIZE_MAX, n = strlen(args);
+	size_t capacity = sizeof(storage) - 2;
 	if(n >= sizeof(storage) - 1) {
 		WARN("Thumb boot arguments must be at most %zu bytes\n", sizeof(storage) - 2);
 		return -1;
@@ -274,6 +347,14 @@ int watch_bootargs_patch(struct iboot64_img* img, const char* args) {
 			dest = p;
 			break;
 		}
+	if(dest == SIZE_MAX && n < sizeof(diagnostic)) {
+		dest = find_string(img, diagnostic);
+		if(dest != SIZE_MAX)
+			capacity = sizeof(diagnostic) - 1;
+	}
+	if(find_string(img, " rd=md0") != SIZE_MAX ||
+		find_string(img, " rd=md0 nand-enable-reformat=1 -progress") != SIZE_MAX)
+		return kernel_bootargs_patch(img, args, dest, capacity);
 	size_t argstr = find_string(img, DEFAULT_BOOTARGS_STRING);
 	if(argstr == SIZE_MAX)
 		argstr = find_string(img, "rd=md0 nand-enable-reformat=1 -progress -restore");
@@ -336,7 +417,8 @@ int watch_bootargs_patch(struct iboot64_img* img, const char* args) {
 		wr16(img, it + 2, 0xbf00);
 	if(fallback != SIZE_MAX)
 		wr32(img, fallback, (uint32_t)(img->base + dest));
-	LOG("Set Thumb boot arguments at 0x%zx\n", dest);
+	LOG("Set Thumb boot arguments at 0x%zx (xref 0x%zx, selector 0x%zx, literal 0x%zx, fallback 0x%zx)\n",
+		dest, x, it, lit, fallback);
 	return 0;
 }
 

@@ -337,7 +337,7 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
         if ((op & 0x9F000000) == 0x90000000) {
             signed adr = ((op & 0x60000000) >> 18) | ((op & 0xFFFFE0) << 8);
             //printf("%llx: ADRP X%d, 0x%llx\n", i, reg, ((long long)adr << 1) + (i & ~0xFFF));
-            value[reg] = ((long long)adr << 1) + (i & ~0xFFF);
+            value[reg] = (int64_t)adr * 2 + (i & ~0xFFF);
             continue;               // XXX should not XREF on its own?
         /*} else if ((op & 0xFFE0FFE0) == 0xAA0003E0) {
             unsigned rd = op & 0x1F;
@@ -386,7 +386,7 @@ xref64(const uint8_t *buf, addr_t start, addr_t end, addr_t what)
             // BL addr
             signed imm = (op & 0x3FFFFFF) << 2;
             if (op & 0x2000000) {
-                imm |= 0xf << 28;
+                imm |= (signed)(0xfu << 28);
             }
             unsigned adr = (unsigned)(i + imm);
             if (adr == what) {
@@ -516,11 +516,10 @@ find_call64(const uint8_t *buf, addr_t start, size_t length)
 addr_t
 follow_call64(const uint8_t *buf, addr_t call)
 {
-    long long w;
-    w = *(uint32_t *)(buf + call) & 0x3FFFFFF;
-    w <<= 64 - 26;
-    w >>= 64 - 26 - 2;
-    return call + w;
+    int64_t w = *(uint32_t *)(buf + call) & 0x3FFFFFF;
+    if(w & (1LL << 25))
+        w -= 1LL << 26;
+    return call + w * 4;
 }
 
 addr_t

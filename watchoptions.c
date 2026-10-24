@@ -569,3 +569,219 @@ int watch_nvram_patch(struct iboot64_img* img) {
 	}
 	return 0;
 }
+
+static size_t cb_target(const struct iboot64_img* img, size_t p) {
+	uint16_t h = rd16(img, p);
+	if((h & 0xf500) != 0xb100)
+		return SIZE_MAX;
+	return p + 4 + ((h >> 3) & 31) * 2 + ((h >> 9) & 1) * 64;
+}
+
+// Require both cache paths to use the same PMGR scratch words.
+static int nonce_cache(const struct iboot64_img* img, size_t call, size_t* branch,
+	uint16_t* replacement) {
+	if(call < 32 || call + 32 > img->len)
+		return 0;
+	size_t b = call - 2, cached;
+	uint16_t h = rd16(img, b);
+	if(h == 0x2000) { // Newer consume_nonce(false).
+		b -= 2;
+		h = rd16(img, b);
+	}
+	if((h & 0xff00) == 0xd100 || (h & 0xff00) == 0xd400) {
+		cached = b + 4 + (int8_t)(h & 255) * 2;
+		*replacement = 0xbf00;
+	} else {
+		// watchOS 1 branches into regeneration, past the cached return.
+		b = call - 12;
+		h = rd16(img, b);
+		if((h & 0xff00) != 0xd000 || b + 4 + (int8_t)(h & 255) * 2 != call)
+			return 0;
+		cached = b + 2;
+		*replacement = 0xe000 | ((call - b - 4) / 2);
+	}
+	if(cached >= img->len || img->len - cached < 10)
+		return 0;
+	if((h & 0xff00) == 0xd400) {
+		if(rd16(img, b - 2) != 0x0780) // LSLS r0,r0,#30 tests PMGR bit 1.
+			return 0;
+	} else if(rd16(img, b - 4) != 0xf010 || rd16(img, b - 2) != 0x0f02)
+		return 0; // TST.W r0,#2.
+	uint32_t flag, low, high, cached_low, cached_high;
+	unsigned reg;
+	size_t q = call + 4, pool;
+	uint16_t store = rd16(img, q);
+	if((store & 0xf83f) == 0x6020 && rd16(img, q + 2) == store + 0x41) {
+		// Newer platforms keep all scratch words under one r4 base.
+		if(rd16(img, q + 4) != 0x6822 || rd16(img, q + 6) != 0xf042 ||
+			rd16(img, q + 8) != 0x0202 || rd16(img, q + 10) != 0x6022 ||
+			rd16(img, q + 12) != 0xbdd0 || cached != q + 14 ||
+			rd16(img, cached) != store + 0x0800 ||
+			rd16(img, cached + 2) != store + 0x0841 ||
+			rd16(img, cached + 4) != 0xbdd0)
+			return 0;
+		size_t load = (h & 0xff00) == 0xd400 ? b - 6 : b - 8;
+		pool = literal(img, load, &reg);
+		if(pool == SIZE_MAX || reg != 4 || rd16(img, load + 2) != 0x6820)
+			return 0;
+		flag = rd32(img, pool);
+		low = flag + ((store >> 6) & 31) * 4;
+		high = low + 4;
+		cached_low = low;
+		cached_high = high;
+	} else {
+		// Early S0 uses three individual literal addresses.
+		pool = literal(img, q, &reg);
+		if(pool == SIZE_MAX || reg != 2)
+			return 0;
+		low = rd32(img, pool);
+		pool = literal(img, q + 2, &reg);
+		if(pool == SIZE_MAX || reg != 3)
+			return 0;
+		high = rd32(img, pool);
+		pool = literal(img, q + 4, &reg);
+		if(pool == SIZE_MAX || reg != 4)
+			return 0;
+		flag = rd32(img, pool);
+		if(rd16(img, q + 6) != 0x6010 || rd16(img, q + 8) != 0x6019 ||
+			rd16(img, q + 10) != 0x6822 || rd16(img, q + 12) != 0xf042 ||
+			rd16(img, q + 14) != 0x0202 || rd16(img, q + 16) != 0x6022 ||
+			(rd16(img, q + 18) != 0xbdd0 && rd16(img, q + 18) != 0xbd90))
+			return 0;
+		pool = literal(img, cached, &reg);
+		if(pool == SIZE_MAX || reg != 0)
+			return 0;
+		cached_low = rd32(img, pool);
+		pool = literal(img, cached + 2, &reg);
+		if(pool == SIZE_MAX || reg != 1 || rd16(img, cached + 4) != 0x6800 ||
+			rd16(img, cached + 6) != 0x6809 ||
+			(rd16(img, cached + 8) != 0xbdd0 && rd16(img, cached + 8) != 0xbd90))
+			return 0;
+		cached_high = rd32(img, pool);
+		int flag_load = 0;
+		for(size_t p = b - 16; p + 2 <= b - 4; p += 2) {
+			pool = literal(img, p, &reg);
+			if(pool != SIZE_MAX && reg == 0 && rd32(img, pool) == flag)
+				flag_load++;
+		}
+		if(flag_load != 1 || rd16(img, b - 6) != 0x6800)
+			return 0;
+	}
+	if((flag & 3) || low != cached_low || high != cached_high || high != low + 4 ||
+		low < flag || low - flag > 0x100 || (flag >= img->base && flag - img->base < img->len))
+		return 0;
+	*branch = b;
+	return 1;
+}
+
+int watch_freshnonce_patch(struct iboot64_img* img) {
+	size_t string = find_string(img, "com.apple.System.boot-nonce"), lit;
+	unsigned reg;
+	size_t refs[3], count = 0, at = 0;
+	while(count < 3 && (at = ref(img, string, at, &reg, &lit)) != SIZE_MAX) {
+		if(reg != 0)
+			return -1;
+		refs[count++] = at;
+		at += 2;
+	}
+	if(!count || count > 2)
+		return -1;
+	size_t reader = function_start(img, refs[0]);
+	if(reader == SIZE_MAX || refs[0] - reader > 32)
+		return -1;
+	// A generator reader must parse exactly 18 hex characters into a uint64.
+	int parser = 0;
+	size_t parse = SIZE_MAX;
+	for(size_t p = refs[0] + 2; p + 14 <= img->len && p < refs[0] + 48; p += 2)
+		if(rd16(img, p) == 0x2812 && (rd16(img, p + 2) & 0xff00) == 0xd100 &&
+			rd16(img, p + 6) == 0x2100 && rd16(img, p + 8) == 0x2210 &&
+			is_bl(img, p + 10)) {
+			parser++;
+			parse = p;
+		}
+	if(parser != 1)
+		return -1;
+	size_t preserve = SIZE_MAX, join = SIZE_MAX;
+	if(count == 2) {
+		preserve = refs[1];
+		if(function_start(img, preserve) != reader || preserve + 14 > img->len ||
+			!is_bl(img, preserve + 2) || !is_bl(img, preserve + 8) ||
+			(rd16(img, preserve + 6) & 0xfd07) != 0xb100 ||
+			(rd16(img, preserve + 12) & 0xfd07) != 0xb100)
+			return -1;
+		join = cb_target(img, preserve + 12);
+		if(join <= preserve + 14 || join > preserve + 48 || join + 2 > img->len ||
+			cb_target(img, preserve + 6) >= join || bl_target(img, preserve + 2) == bl_target(img, preserve + 8))
+			return -1;
+		uint16_t status = rd16(img, join);
+		if((status & 0xffc7) == 0x4600) {
+			// watchOS 2 returns the saved parse-success flag.
+			unsigned saved = (status >> 3) & 7;
+			int success = 0;
+			for(size_t p = parse + 14; p + 2 <= preserve; p += 2)
+				if(rd16(img, p) == (0x2001 | saved << 8))
+					success++;
+			if(saved < 4 || saved > 6 || success != 1 || join + 10 > img->len ||
+				rd16(img, join + 2) != 0xb002 || rd16(img, join + 4) != 0xf85d ||
+				rd16(img, join + 6) != 0xbb04 || rd16(img, join + 8) != 0xbdf0)
+				return -1;
+		} else {
+			// watchOS 1 saves the seed and status in the consuming reader.
+			unsigned literal_reg;
+			size_t success = literal(img, parse + 14, &literal_reg);
+			if(success == SIZE_MAX || literal_reg != 4 || !rd32(img, success) ||
+				join + 22 > img->len || (status & 0xfd07) != 0xb904 ||
+				cb_target(img, join) != join + 12 || rd16(img, parse + 16) != 0x9103 ||
+				rd16(img, parse + 18) != 0x9002 || rd16(img, join + 2) != 0xa802 ||
+				rd16(img, join + 4) != 0x2108 || !is_bl(img, join + 6) ||
+				(rd16(img, join + 10) & 0xfd07) != 0xb900 ||
+				rd16(img, join + 12) != 0x9802 || rd16(img, join + 14) != 0x1f3c ||
+				rd16(img, join + 16) != 0x9903 || rd16(img, join + 18) != 0x46a5 ||
+				rd16(img, join + 20) != 0xbd90)
+				return -1;
+		}
+	} else {
+		// The non-consuming reader ends directly after its parse/error paths.
+		size_t end = refs[0];
+		unsigned calls = 0;
+		for(; end + 4 <= img->len && end < refs[0] + 96; end += width(rd16(img, end))) {
+			uint16_t h = rd16(img, end);
+			if(is_bl(img, end) || ((h & 0xf800) == 0xf000 && (rd16(img, end + 2) & 0xd001) == 0xc000))
+				calls++;
+			if(h == 0xbdf0)
+				break;
+		}
+		if(end >= refs[0] + 96 || end + 4 > img->len || calls != 4)
+			return -1;
+	}
+	size_t branch = SIZE_MAX, consume = SIZE_MAX, call = SIZE_MAX;
+	uint16_t replacement = 0;
+	unsigned candidates = 0;
+	for(size_t p = 0x340; p + 4 <= img->len; p += 2) {
+		if(bl_target(img, p) != reader)
+			continue;
+		size_t b;
+		uint16_t value;
+		if(nonce_cache(img, p, &b, &value)) {
+			branch = b; replacement = value; consume = reader; call = p; candidates++;
+			continue;
+		}
+		size_t function = function_start(img, p);
+		if(function == SIZE_MAX || function == reader)
+			continue;
+		for(size_t q = 0x340; q + 4 <= img->len; q += 2)
+			if(bl_target(img, q) == function && nonce_cache(img, q, &b, &value)) {
+				branch = b; replacement = value; consume = function; call = q; candidates++;
+			}
+	}
+	if(candidates != 1)
+		return -1;
+	if(preserve != SIZE_MAX) {
+		wr16(img, preserve, 0xe000 | ((join - preserve - 4) / 2));
+		LOG("Preserved Thumb nonce generator at 0x%zx (join 0x%zx)\n", preserve, join);
+	}
+	wr16(img, branch, replacement);
+	LOG("Regenerated Thumb nonce at 0x%zx (reader 0x%zx, consume 0x%zx, call 0x%zx)\n",
+		branch, reader, consume, call);
+	return 0;
+}

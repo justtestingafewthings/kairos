@@ -121,6 +121,356 @@ static size_t a64_function(const struct iboot64_img* image, size_t ref) {
 	return 0;
 }
 
+static size_t a64_bl_target(const struct iboot64_img* image, size_t p) {
+	if(p > image->len || image->len - p < 4)
+		return 0;
+	uint32_t op = a64_word(image, p);
+	if((op & 0xfc000000) != 0x94000000)
+		return 0;
+	int64_t target = (int64_t)p + a64_signed(op & 0x03ffffff, 26) * 4;
+	return target >= 0x340 && (uint64_t)target < image->len ? (size_t)target : 0;
+}
+
+static int a64_mov_address(const struct iboot64_img* image, size_t p,
+	unsigned* reg, uint64_t* address, size_t* width) {
+	if(p > image->len || image->len - p < 4)
+		return 0;
+	uint32_t op = a64_word(image, p), kind = op & 0xff800000;
+	if(kind != 0xd2800000 && kind != 0x92800000)
+		return 0; // MOVZ/MOVN Xn,#imm{,LSL #shift}
+	*reg = op & 31;
+	*address = (uint64_t)((op >> 5) & 0xffff) << (((op >> 21) & 3) * 16);
+	if(kind == 0x92800000)
+		*address = ~*address;
+	*width = 4;
+	while(*width < 16 && p + *width + 4 <= image->len) {
+		op = a64_word(image, p + *width);
+		if((op & 0xff80001f) != (0xf2800000 | *reg))
+			break;
+		unsigned shift = ((op >> 21) & 3) * 16;
+		*address = (*address & ~((uint64_t)0xffff << shift)) |
+			((uint64_t)((op >> 5) & 0xffff) << shift);
+		*width += 4;
+	}
+	return *reg != 31;
+}
+
+// iOS 7 loads cached words before the reader, using separate absolute addresses.
+static size_t a64_nonce_cache_early(const struct iboot64_img* image, size_t call) {
+	if(call < 0x380 || image->len - call < 68)
+		return 0;
+	for(size_t branch = call - 4; branch + 128 > call && branch >= 0x344; branch -= 4) {
+		uint32_t test = a64_word(image, branch), flag = a64_word(image, branch - 4);
+		if((test & 0xfff80000) != 0x36080000 || // TBZ Wn,#1,reader
+			(int64_t)branch + a64_signed((test >> 5) & 0x3fff, 14) * 4 != (int64_t)call ||
+			(flag & 0xffc00000) != 0xb9400000 || (flag & 31) != (test & 31))
+			continue;
+		unsigned low_base, high_base, store_base, second_base;
+		uint64_t low, high, stored_low, stored_high;
+		size_t width, p = branch + 4;
+		if(!a64_mov_address(image, p, &low_base, &low, &width))
+			continue;
+		p += width;
+		if(p + 4 > call || a64_word(image, p) != (0xb9400000 | (low_base << 5)))
+			continue;
+		p += 4;
+		if(!a64_mov_address(image, p, &high_base, &high, &width))
+			continue;
+		p += width;
+		if(p + 8 != call)
+			continue;
+		uint32_t high_load = a64_word(image, p), skip = a64_word(image, p + 4),
+			split = a64_word(image, call + 4);
+		unsigned high_reg = split & 31;
+		if((split & 0xffffffe0) != 0xd360fc00 ||
+			high_reg == 0 || high_reg == 31 ||
+			high_load != (0xb9400000 | (high_base << 5) | high_reg) ||
+			(skip & 0xfc000000) != 0x14000000 || high != low + 4)
+			continue;
+		size_t skip_at = p + 4;
+		p = call + 8;
+		if(!a64_mov_address(image, p, &store_base, &stored_low, &width))
+			continue;
+		p += width;
+		if(p + 4 > image->len || a64_word(image, p) != (0xb9000000 | (store_base << 5)))
+			continue;
+		p += 4;
+		if(!a64_mov_address(image, p, &second_base, &stored_high, &width))
+			continue;
+		p += width;
+		if(p + 16 > image->len ||
+			a64_word(image, p) != (0xb9000000 | (second_base << 5) | high_reg) ||
+			stored_low != low || stored_high != high)
+			continue;
+		uint32_t load_flag = a64_word(image, p + 4), set_flag = a64_word(image, p + 8),
+			store_flag = a64_word(image, p + 12);
+		unsigned flag_reg = load_flag & 31;
+		if((load_flag & ~31u) != (flag & ~31u) ||
+			(set_flag & 0xfffffc00) != 0x321f0000 ||
+			((set_flag >> 5) & 31) != flag_reg || (set_flag & 31) != flag_reg ||
+			store_flag != (load_flag & ~0x00400000u) ||
+			(int64_t)skip_at + a64_signed(skip & 0x03ffffff, 26) * 4 != (int64_t)p + 16)
+			continue;
+		return branch;
+	}
+	return 0;
+}
+
+// Require both cache paths to use the same PMGR scratch words.
+static size_t a64_nonce_cache(const struct iboot64_img* image, size_t call) {
+	if(call < 12 || image->len - call < 44)
+		return 0;
+	size_t branch = call - 4;
+	if(a64_word(image, branch) == 0x52800000) // MOV W0,#0 (force_random = false)
+		branch -= 4;
+	uint32_t test = a64_word(image, branch), flag = a64_word(image, branch - 4);
+	if((test & 0xfff80000) != 0x37080000 || // TBNZ Wn,#1,cached
+		(flag & 0xffc00000) != 0xb9400000 || (flag & 31) != (test & 31))
+		return 0;
+	unsigned base = (flag >> 5) & 31;
+	if(base == 31)
+		return 0;
+	int64_t cached = (int64_t)branch + a64_signed((test >> 5) & 0x3fff, 14) * 4;
+	if(cached != (int64_t)call + 32 || (uint64_t)cached + 8 > image->len)
+		return 0;
+	uint32_t high = a64_word(image, call + 4), low_store = a64_word(image, call + 8),
+		high_store = a64_word(image, call + 12), load_flag = a64_word(image, call + 16),
+		set_flag = a64_word(image, call + 20), store_flag = a64_word(image, call + 24),
+		join = a64_word(image, call + 28), low_load = a64_word(image, cached),
+		high_load = a64_word(image, cached + 4);
+	unsigned high_reg = high & 31, flag_reg = load_flag & 31;
+	if((high & 0xffffffe0) != 0xd360fc00 || // LSR Xn,X0,#32
+		high_reg == 0 || high_reg == 31 || flag_reg == 31 ||
+		(low_store & 0xffc003ff) != (0xb9000000 | (base << 5)) ||
+		(high_store & 0xffc003ff) != (0xb9000000 | (base << 5) | high_reg) ||
+		((high_store >> 10) & 0xfff) != ((low_store >> 10) & 0xfff) + 1 ||
+		(load_flag & ~31u) != (flag & ~31u) ||
+		(set_flag & 0xfffffc00) != 0x321f0000 || // ORR Wn,Wn,#2
+		((set_flag >> 5) & 31) != flag_reg || (set_flag & 31) != flag_reg ||
+		store_flag != ((load_flag & ~0x00400000u)) ||
+		join != 0x14000003 || // B past the two cached loads
+		low_load != (low_store | 0x00400000u) ||
+		high_load != (high_store | 0x00400000u))
+		return 0;
+	return branch;
+}
+
+// Preserve the generator so repeated nonce queries remain deterministic.
+static int a64_nonce_keep_generator(const struct iboot64_img* image, size_t reader,
+	size_t string, size_t getter, size_t* removal, size_t* join) {
+	size_t refs[3], count = 0, end = reader + 0x600;
+	if(end < reader || end > image->len)
+		end = image->len;
+	// Cleanup blocks can be reached by branches beyond the first RET.
+	uint8_t seen[0x600 / 4] = {0};
+	size_t work[0x600 / 4], work_count = 1;
+	work[0] = reader;
+	while(work_count) {
+		size_t p = work[--work_count];
+		while(p >= reader && p + 4 <= end) {
+			size_t index = (p - reader) / 4;
+			if(seen[index])
+				break;
+			seen[index] = 1;
+			uint32_t op = a64_word(image, p);
+			unsigned reg;
+			size_t address, width;
+			int direct = a64_address(image, p, &reg, &address, &width) && address == string;
+			if(direct || (getter && a64_bl_target(image, p) == getter)) {
+				if((direct && reg != 0) || count == 3)
+					return -1;
+				refs[count++] = p;
+			}
+			if(op == 0xd65f03c0 || op == 0xd65f0fff || op == 0xd65f0bff ||
+				(op & 0xfffffc1f) == 0xd61f0000) // RET or BR
+				break;
+			int64_t target = -1;
+			if((op & 0xfc000000) == 0x14000000) {
+				target = (int64_t)p + a64_signed(op & 0x03ffffff, 26) * 4;
+			} else if((op & 0xff000010) == 0x54000000) {
+				target = (int64_t)p + a64_signed((op >> 5) & 0x7ffff, 19) * 4;
+			} else if((op & 0x7e000000) == 0x34000000) {
+				target = (int64_t)p + a64_signed((op >> 5) & 0x7ffff, 19) * 4;
+			} else if((op & 0x7e000000) == 0x36000000) {
+				target = (int64_t)p + a64_signed((op >> 5) & 0x3fff, 14) * 4;
+			}
+			if(target >= (int64_t)reader && target < (int64_t)end && !(target & 3)) {
+				if(work_count == sizeof(work) / sizeof(work[0]))
+					return -1;
+				work[work_count++] = (size_t)target;
+			}
+			if((op & 0xfc000000) == 0x14000000)
+				break;
+			p += 4;
+		}
+	}
+	if(!count || count > 2)
+		return -1;
+	if(count == 2 && refs[0] > refs[1]) {
+		size_t first = refs[0];
+		refs[0] = refs[1];
+		refs[1] = first;
+	}
+	*removal = *join = 0;
+	if(count == 1)
+		return 0;
+	unsigned reg;
+	size_t address, width;
+	if(!a64_address(image, refs[1], &reg, &address, &width))
+		return -1;
+	size_t p = refs[1] + width;
+	if(p + 4 <= end && a64_word(image, p) == 0xd503201f)
+		p += 4;
+	if(p + 16 > end || !a64_bl_target(image, p) || !a64_bl_target(image, p + 8))
+		return -1;
+	uint32_t unset_result = a64_word(image, p + 4), save_result = a64_word(image, p + 12);
+	if((unset_result & 0xff00001f) != 0x34000000 ||
+		(save_result & 0xff00001f) != 0x34000000)
+		return -1; // CBZ W0,diagnostic; BL save; CBZ W0,return
+	int64_t target = (int64_t)p + 12 + a64_signed((save_result >> 5) & 0x7ffff, 19) * 4;
+	if(target <= (int64_t)p + 12 || target >= (int64_t)end ||
+		!seen[((size_t)target - reader) / 4])
+		return -1;
+	uint32_t result = a64_word(image, target);
+	unsigned saved = (result >> 16) & 31;
+	if((result & 0xff000000) == 0xb5000000 && (result & 31) >= 19 && (result & 31) <= 28) {
+		// iOS 7 returns the saved seed or generates a random one.
+		int64_t success = target + a64_signed((result >> 5) & 0x7ffff, 19) * 4;
+		if(success <= target || success >= (int64_t)end ||
+			!seen[((size_t)success - reader) / 4])
+			return -1;
+		saved = result & 31;
+		int parsed = 0;
+		for(size_t q = reader; q + 4 < refs[1]; q += 4)
+			if((a64_word(image, q) & 0xffc003ff) == 0xf80003a0 &&
+				(a64_word(image, q + 4) & 0x9f00001f) == (0x90000000 | saved))
+				parsed = 1; // STUR X0,[X29,#seed]; ADRP Xsaved,success marker.
+		if(!parsed)
+			return -1;
+		*removal = refs[1];
+		*join = (size_t)target;
+		return 0;
+	}
+	if((result & 0xffe0ffff) != 0xaa0003e0 || saved < 19 || saved > 28)
+		return -1; // MOV X0,Xsaved returns the parse result.
+	int success = 0;
+	for(size_t q = reader; q < refs[1]; q += 4)
+		if(a64_word(image, q) == (0x52800020 | saved) ||
+			a64_word(image, q) == (0x320003e0 | saved))
+			success = 1; // MOV Wsaved,#1
+	if(!success)
+		return -1;
+	size_t epilogue_end = (size_t)target + 4;
+	while(epilogue_end + 4 <= end &&
+		a64_word(image, epilogue_end) != 0xd65f03c0 &&
+		a64_word(image, epilogue_end) != 0xd65f0fff &&
+		a64_word(image, epilogue_end) != 0xd65f0bff)
+		epilogue_end += 4;
+	if(epilogue_end + 4 > end)
+		return -1;
+	for(size_t q = target + 4; q < epilogue_end; q += 4) {
+		uint32_t op = a64_word(image, q);
+		if((op & 0xffc003ff) != 0x910003ff && // ADD SP,SP,#imm
+			(op & 0xffc003ff) != 0xd10003bf && // SUB SP,X29,#imm
+			(op & 0xffc003e0) != 0xa94003e0 && // LDP ..., [SP,#imm]
+			(op & 0xffc003e0) != 0xa8c003e0 && // LDP ..., [SP],#imm
+			op != 0xd50323ff) // AUTIBSP
+			return -1;
+	}
+	*removal = refs[1];
+	*join = (size_t)target;
+	return 0;
+}
+
+int freshnonce_patch(struct iboot64_img* image) {
+	const char name[] = "com.apple.System.boot-nonce";
+	const uint8_t* found = memmem(image->buf, image->len, name, sizeof(name));
+	if(!found) {
+		WARN("Could not find ARM64 boot-nonce generator\n");
+		return -1;
+	}
+	size_t string = found - (const uint8_t *)image->buf, selected = 0,
+		selected_removal = 0, selected_join = 0;
+	uint32_t selected_opcode = 0;
+	for(size_t ref = 0x340; ref + 12 <= image->len; ref += 4) {
+		unsigned reg;
+		size_t address, width;
+		if(!a64_address(image, ref, &reg, &address, &width) || address != string || reg != 0)
+			continue;
+		size_t readers[32], getters[32], count = 0;
+		size_t direct = a64_function(image, ref);
+		if(direct && ref - direct < 0x600) {
+			readers[count] = direct;
+			getters[count++] = 0;
+		}
+		// Outlined getenv stubs have no stack frame.
+		size_t tail = ref + width;
+		if(a64_word(image, tail) == 0xd503201f)
+			tail += 4;
+		if(tail + 4 <= image->len && (a64_word(image, tail) & 0xfc000000) == 0x14000000) {
+			for(size_t p = 0x340; p + 4 <= image->len; p += 4) {
+				if(a64_bl_target(image, p) != ref)
+					continue;
+				size_t caller = a64_function(image, p);
+				if(!caller || p - caller > 0x600)
+					continue;
+				if(count == 32) {
+					WARN("Too many ARM64 generator-reader candidates\n");
+					return -1;
+				}
+				readers[count] = caller;
+				getters[count++] = ref;
+			}
+		}
+		for(size_t candidate = 0; candidate < count; candidate++) {
+			size_t reader = readers[candidate];
+			size_t removal, join;
+			if(a64_nonce_keep_generator(image, reader, string, getters[candidate], &removal, &join) < 0)
+				continue;
+			for(size_t call = 0x340; call + 4 <= image->len; call += 4) {
+				if(a64_bl_target(image, call) != reader)
+					continue;
+				size_t wrapper = a64_function(image, call);
+				if(!wrapper || call - wrapper > 0x200)
+					continue;
+				for(size_t q = 0x340; q + 4 <= image->len; q += 4) {
+					if(q != call && a64_bl_target(image, q) != wrapper)
+						continue;
+					size_t branch = a64_nonce_cache(image, q);
+					uint32_t opcode = 0xd503201f;
+					if(!branch) {
+						branch = a64_nonce_cache_early(image, q);
+						opcode = 0x14000000 | (uint32_t)((q - branch) / 4);
+					}
+					if(!branch)
+						continue;
+					if(selected && (selected != branch || selected_removal != removal)) {
+						WARN("Ambiguous ARM64 nonce cache path\n");
+						return -1;
+					}
+					selected = branch;
+					selected_removal = removal;
+					selected_join = join;
+					selected_opcode = opcode;
+				}
+			}
+		}
+	}
+	if(!selected) {
+		WARN("Could not validate ARM64 nonce cache and generator retention\n");
+		return -1;
+	}
+	write_opcode(image->buf, selected, selected_opcode);
+	LOG("Patched ARM64 nonce cache at 0x%zx\n", selected);
+	if(selected_removal) {
+		uint32_t branch = 0x14000000 | (uint32_t)((selected_join - selected_removal) / 4);
+		write_opcode(image->buf, selected_removal, branch);
+		LOG("Preserved ARM64 boot-nonce generator at 0x%zx (join 0x%zx)\n",
+			selected_removal, selected_join);
+	}
+	return 0;
+}
+
 static int a64_tag(const struct iboot64_img* image, size_t start,
 	size_t end, uint32_t tag) {
 	for(size_t p = start; p + 8 <= end; p += 4) {

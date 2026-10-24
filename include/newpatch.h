@@ -57,4 +57,5 @@ bool has_kernel_load_k(struct iboot64_img* iboot_in);
 bool has_recovery_console_k(struct iboot64_img* iboot_in);
 int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintptr_t ptr);
 int unlock_nvram(struct iboot64_img* iboot_in);
+int freshnonce_patch(struct iboot64_img* iboot_in);
 bool iboot64_pac_check(struct iboot64_img* iboot_in);

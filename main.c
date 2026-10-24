@@ -30,6 +30,8 @@ int main(int argc, char* argv[]) {
 		printf("Options:\n\t-b [args]\t\tset boot-args\n");
 		printf("\t-c [cmd] [location]\trelocate command handler\n");
 		printf("\t-n\t\t\tunlock nvram\n");
+		printf("\t-f, --fresh-nonce\tbypass cached nonce (requires a saved boot-nonce generator)\n");
+		printf("\t--fresh-nonce-only\tadd only the nonce patch to an already patched image\n");
 		printf("\nExample usage:\n%s iBEC.dec iBEC.patched -n -b \"-v debug=0x09\" -c \"go\" 0x830000300\n",argv[0]);
 		return -1;
 	}
@@ -43,6 +45,8 @@ int main(int argc, char* argv[]) {
 	int ret = 0;
 	memset(&iboot_in, 0, sizeof(iboot_in));
 	bool doNvramUnlock = false;
+	bool doFreshNonce = false;
+	bool freshNonceOnly = false;
 
 	for(int i = 3; i < argc; i++) {
 		if(!strcmp(argv[i], "-b") && i + 1 < argc) {
@@ -59,12 +63,20 @@ int main(int argc, char* argv[]) {
 			}
 		} else if(!strcmp(argv[i], "-n")) {
 			doNvramUnlock = true;
+		} else if(!strcmp(argv[i], "-f") || !strcmp(argv[i], "--fresh-nonce")) {
+			doFreshNonce = true;
+		} else if(!strcmp(argv[i], "--fresh-nonce-only")) {
+			doFreshNonce = true;
+			freshNonceOnly = true;
 		} else {
 			WARN("Unknown option or missing argument: %s\n", argv[i]);
 			return 1;
 		}
 	}
-	// read in image
+	if(freshNonceOnly && (doNvramUnlock || bootArgs || command_str)) {
+		WARN("--fresh-nonce-only cannot be combined with other patch options\n");
+		return 1;
+	}
 	FILE* fp = fopen(inFile,"rb");
 	if(!fp) {
 		printf("Error opening %s for reading\n",inFile);
@@ -107,6 +119,16 @@ int main(int argc, char* argv[]) {
 		get_iboot64_version(&iboot_in);
 		LOG("ARMv7 Thumb Watch bootloader, base 0x%08x, iBoot-%u.%u\n", base, iboot_in.VERS,
 			iboot_in.minor_vers);
+		if(doFreshNonce && (!has_kernel_load_k(&iboot_in) || !has_recovery_console_k(&iboot_in))) {
+			WARN("Fresh nonce patch requires a kernel-loading recovery bootloader\n");
+			goto patch_failed;
+		}
+		if(doFreshNonce && watch_freshnonce_patch(&iboot_in) < 0) {
+			WARN("Failed to patch Thumb nonce regeneration\n");
+			goto patch_failed;
+		}
+		if(freshNonceOnly)
+			goto write_output;
 		ret = watch_sigcheck_patch(&iboot_in);
 		if(ret < 0)
 			goto patch_failed;
@@ -137,6 +159,16 @@ int main(int argc, char* argv[]) {
 		goto patch_failed;
 	}
 	LOG("Base address: 0x%llx\n",get_iboot64_base_address(&iboot_in));
+	if(doFreshNonce && (!has_kernel_load_k(&iboot_in) || !has_recovery_console_k(&iboot_in))) {
+		WARN("Fresh nonce patch requires a kernel-loading recovery bootloader\n");
+		goto patch_failed;
+	}
+	if(doFreshNonce && freshnonce_patch(&iboot_in) < 0) {
+		WARN("Failed to patch ARM64 nonce regeneration\n");
+		goto patch_failed;
+	}
+	if(freshNonceOnly)
+		goto write_output;
 	bool pac = iboot64_pac_check(&iboot_in);
 	if(has_kernel_load_k(&iboot_in)) {
 		LOG("Does have kernel load\n");
@@ -154,7 +186,7 @@ int main(int argc, char* argv[]) {
 			WARN("Could not enable kernel debug\n");
 	}
 	if(has_recovery_console_k(&iboot_in)) {
-		if(command_str && (command_ptr != 0)) { // need to reassign command handler
+		if(command_str && (command_ptr != 0)) {
 			LOG("Changing command handler %s to 0x%llx...\n",command_str,command_ptr);
 			ret = do_command_handler_patch(&iboot_in,command_str,command_ptr);
 			if(ret < 0) {
@@ -177,7 +209,6 @@ int main(int argc, char* argv[]) {
 		goto patch_failed;
 
 write_output:
-	// now write file
 	fp = fopen(outFile,"wb+");
 	if(!fp) {
 		printf("Error opening %s for writing\n",outFile);

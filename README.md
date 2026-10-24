@@ -10,6 +10,7 @@ Patches include:
 * enabling of kernel debug
 * command handler modification
 * NVRAM unlock
+* nonce cache bypass and generator preservation
 
 Why?
 ----

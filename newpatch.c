@@ -505,9 +505,7 @@ int doFinalBootArgs(struct iboot64_img* iboot_in, addr_t xref, addr_t default_ar
 	}
 	LOG("Found branch pointing to 0x%llx at 0x%llx\n",((bImmediate-(temp/4))+temp)+iboot_in->base,temp);
 	temp = ((bImmediate-(temp/4))+temp); // set temp to the addr that bl goes to
-	for(int i = 0; i < 15; i++) { // look for next adr instruction. honestly, this may not even be needed
-	// it doesn't seem to do any damage, but for older iboots boot args don't seem to have a conditional branch where a dst reg is replaced
-	// and the csel -> mov insn really seems to do what we want here anyway...
+	for(int i = 0; i < 15; i++) {
 		if (temp > iboot_in->len)
 			break;
 		if(get_type(get_insn(iboot_in->buf,temp)) != adr)
@@ -534,33 +532,31 @@ void do_kdbg_mov(struct iboot64_img* iboot_in, addr_t xref) {
 	LOG("Wrote MOVZ X0, #1 to 0x%llx\n",xref+iboot_in->base);
 }
 
-bool checkIMG4Ref(uint8_t* buf, addr_t xref) {
-	xref -= 4;
-	for(int i = 0; i < 10; i++) {
-		/*
-		 * looking for
-		 * add x2, sp, #0x...
-		 * add x3, sp, #0x...
-		*/
+static bool checkIMG4Ref(uint8_t* buf, addr_t xref) {
+	// Find ADD X3,SP,#imm before the IMG4 call.
+	for(int i = 0; i < 10 && xref >= 4; i++) {
+		xref -= 4;
 		if((get_type(get_insn(buf,xref)) == add) && (get_rd(get_insn(buf,xref)) == 3) && (get_rn(get_insn(buf,xref)) == 0x1f)) {
 			return true;
 		}
-		xref -= 4;
 	}
 	return false;
 }
 
-void do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, bool pac) {
+static int do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, bool pac) {
+	if(iboot_in->len < 8 || img4Xref > iboot_in->len - 4 || (img4Xref & 3))
+		return -1;
 	addr_t img4refFtop = bof64(iboot_in->buf, 0, img4Xref);
 	if (pac == true) {
+		if(img4refFtop < 4)
+			return -1;
 		img4refFtop = img4refFtop - 0x4;
 	}
+	if(!img4refFtop || img4refFtop >= iboot_in->len)
+		return -1;
 	LOG("Found beginning of _image4_get_partial at 0x%llx\n",img4refFtop);
-	// older iBoot versions don't work with this patch method
-	// iPatcher, made by @exploit3dguy has some really effective patches for old iBoots
-	if (0) { // less than iOS 10
-		// It works effectively for decrypted images, 
-		// but does not for encrypted images. (tested: iPhone8,1, iBoot-2817.1.94)
+	// Use iPatcher's IMG4 check patch for older iBoots.
+	if (iboot_in->VERS < 3406) { // iOS 7-9
 		void* movkLoc = NULL;
 		uint32_t movkInsn = 0;
 		if (iboot_in->VERS < 2261) // iOS 7
@@ -573,57 +569,51 @@ void do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, bool p
 		if (!movkLoc) {
 			WARN("Could not find MOVK W%llu, #0x4348 instruction for old iBoot\n", BIT_RANGE(movkInsn,0,4));
 			WARN("RSA PATCH FAILED\n");
-			return;
+			return -1;
 		}
 		addr_t movkOffset = (addr_t)GET_IBOOT_FILE_OFFSET(iboot_in,movkLoc);
 		LOG("Found MOVK W%llu, #0x4348 at 0x%llx\n",BIT_RANGE(movkInsn,0,4), movkOffset);
 		addr_t funcStart = bof64(iboot_in->buf,0,movkOffset); // find beginning of img4 check function
+		if(!funcStart || funcStart > iboot_in->len - 8)
+			return -1;
 		LOG("Patching RSA check at 0x%llx\n",funcStart + iboot_in->base);
 		uint32_t finalMovInsn = new_mov_immediate_insn(0,0,1);
 		uint32_t retInsn = new_ret_insn(-1);
-		// make it return 0
 		write_opcode(iboot_in->buf,funcStart,finalMovInsn); // mov x0, #0
 		write_opcode(iboot_in->buf,funcStart+4,retInsn);    // ret
 		LOG("Did MOV r0, #0 and RET\n");
-		return;
+		return 0;
 	}
-	// jump around
 	addr_t img4GetPartialRef = xref64code(iboot_in->buf, 0, iboot_in->len, img4refFtop);
-    
-	
+	if(!img4GetPartialRef || img4GetPartialRef >= iboot_in->len)
+		return -1;
 	for(int i = 0; i < 20; i++) {
 		if(checkIMG4Ref(iboot_in->buf,img4GetPartialRef))
 			break;
-		img4GetPartialRef = xref64code(iboot_in->buf,img4GetPartialRef+4,iboot_in->len-img4GetPartialRef-4,img4refFtop);
+		if(img4GetPartialRef > iboot_in->len - 4)
+			return -1;
+		img4GetPartialRef = xref64code(iboot_in->buf,img4GetPartialRef+4,
+			iboot_in->len,img4refFtop);
 
-		if(i == 19) {
+		if(!img4GetPartialRef || i == 19) {
 			WARN("Could not find correct xref for _image4_get_partial.\n");
 			WARN("RSA PATCH FAILED\n");
-			return;
+			return -1;
 		}
 	}
 	LOG("Found xref to _image4_get_partial at 0x%llx\n",img4GetPartialRef);
 	addr_t getPartialRefFtop = bof64(iboot_in->buf,0,img4GetPartialRef);
+	if(!getPartialRefFtop)
+		return -1;
 	LOG("Found start of sub_%llx\n",iboot_in->base+getPartialRefFtop);
 	addr_t x2_adr = 0;
 	addr_t x3_adr = 0;
 
-	insn_type_t x3_type = adr;
-	if (iboot_in->VERS < 2817){ // iOS 8
-		/*
-		* adr        x2, #0x83d38d680 <-
-		* nop
-		* add        x3, sp, #0x9
-		* ...
-		*/
-		x3_type = add;
-	}
-    
-	while(1) {
+	while(getPartialRefFtop <= iboot_in->len - 8) {
 		getPartialRefFtop += 4;
 		if(get_type(get_insn(iboot_in->buf,getPartialRefFtop)) == adr && get_rd(get_insn(iboot_in->buf,getPartialRefFtop)) == 2)
 			x2_adr = getPartialRefFtop;
-		else if(get_type(get_insn(iboot_in->buf,getPartialRefFtop)) == x3_type && get_rd(get_insn(iboot_in->buf,getPartialRefFtop)) == 3)
+		else if(get_type(get_insn(iboot_in->buf,getPartialRefFtop)) == adr && get_rd(get_insn(iboot_in->buf,getPartialRefFtop)) == 3)
 			x3_adr = getPartialRefFtop;
 		else if(get_type(get_insn(iboot_in->buf,getPartialRefFtop)) == bl) {
 			if(x2_adr && x3_adr)
@@ -634,20 +624,38 @@ void do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, bool p
 			}
 		}
 	}
-	int64_t verifyRef = get_addr_for_adr(x2_adr,get_insn(iboot_in->buf,x2_adr));
-	LOG("Found ADR X2, 0x%llx at 0x%llx\n",verifyRef-(x2_adr/4)+x2_adr+iboot_in->base,x2_adr);
-	addr_t verifyFunc = (get_ptr_loc(iboot_in->buf,verifyRef-(x2_adr/4)+x2_adr)-iboot_in->base); // dereference
-	if (verifyFunc > (addr_t)(iboot_in->buf+iboot_in->len)) { // in older versions a dereference does not need to be made
-		verifyFunc = verifyRef-(x2_adr/4)+x2_adr;
+	if(!x2_adr || !x3_adr || getPartialRefFtop > iboot_in->len - 8) {
+		WARN("Could not find the IMG4 verification arguments\n");
+		return -1;
 	}
+	int64_t verifyRef = get_addr_for_adr(x2_adr,get_insn(iboot_in->buf,x2_adr));
+	int64_t verifyTarget = verifyRef - (int64_t)(x2_adr / 4) + (int64_t)x2_adr;
+	if(verifyTarget < 0 || (uint64_t)verifyTarget >= iboot_in->len) {
+		WARN("IMG4 verification target is outside the bootloader\n");
+		return -1;
+	}
+	LOG("Found ADR X2, 0x%llx at 0x%llx\n",verifyTarget+iboot_in->base,x2_adr);
+	addr_t verifyFunc = (addr_t)verifyTarget;
+	if(iboot_in->len - (size_t)verifyTarget >= sizeof(uint64_t)) {
+		uint64_t pointer;
+		memcpy(&pointer, (uint8_t *)iboot_in->buf + verifyTarget, sizeof(pointer));
+		if(pointer >= iboot_in->base && pointer - iboot_in->base < iboot_in->len)
+			verifyFunc = (addr_t)(pointer - iboot_in->base);
+	}
+	if((verifyFunc & 3) || verifyFunc > iboot_in->len - 4)
+		return -1;
 	LOG("Call to sub_%llx\n",verifyFunc+iboot_in->base);
 	addr_t crawl = verifyFunc;
 	if (iboot_in->VERS < 5540) { // iOS 10-12
 		crawl += 4;
-		while(get_type(get_insn(iboot_in->buf,crawl)) != ret) crawl += 4;
+		while(crawl <= iboot_in->len - 4 && get_type(get_insn(iboot_in->buf,crawl)) != ret)
+			crawl += 4;
+		if(crawl > iboot_in->len - 4) {
+			WARN("Could not find the end of the IMG4 verification function\n");
+			return -1;
+		}
 		LOG("RET found for sub_%llx at 0x%llx\n",verifyFunc+iboot_in->base,crawl);
 	}
-	// otherwise, just patch at beginning, doesn't seem like this actually harms anything
 	uint32_t movInsn = new_mov_immediate_insn(0,0,1);
 	uint32_t retInsn = new_ret_insn(-1);
 	
@@ -657,39 +665,34 @@ void do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, bool p
 	search[1] = retInsn;
 	mov_x0_0__ret = memmem(iboot_in->buf, iboot_in->len, &search, sizeof(search));
 	if(mov_x0_0__ret) {
-		// case1: ret0 gadget already exist
 		addr_t ret0_gadget = (addr_t)(mov_x0_0__ret - iboot_in->buf);
 		LOG("ret0 gadget at 0x%llx\n", ret0_gadget);
-		// make branch
 		write_opcode(iboot_in->buf, crawl, new_branch(crawl, ret0_gadget));
 		LOG("Did MOV r0, #0 and RET\n");
 	} else {
-		// case2: ret0 gadget does not exist.
 		void* nop_region = NULL;
 		uint32_t search_nop_region[16];
 		for(int i=0; i<16;i++) {
 			search_nop_region[i] = new_nop();
 		}
-		// Search NOP region
 		nop_region = memmem(iboot_in->buf, iboot_in->len, &search_nop_region, sizeof(search_nop_region));
 		if(nop_region) {
 			LOG("NOP region at 0x%llx\n", (addr_t)(nop_region - iboot_in->buf));
 			addr_t new_ret0 = (addr_t)(nop_region - iboot_in->buf + (4*8));
-			// create ret0
 			write_opcode(iboot_in->buf, new_ret0, movInsn);
 			write_opcode(iboot_in->buf, new_ret0+4, retInsn);
 			LOG("new ret0 gadget at 0x%llx\n", new_ret0);
-			// make branch
 			write_opcode(iboot_in->buf, crawl, new_branch(crawl, new_ret0));
 			LOG("Did MOV r0, #0 and RET\n");
 		} else {
-			// case3: ret0 gadget and NOP region does not exist.
-			// overwrite to ret
+			if(crawl > iboot_in->len - 8)
+				return -1;
 			write_opcode(iboot_in->buf,crawl,movInsn);
 			write_opcode(iboot_in->buf,crawl+4,retInsn);
 			LOG("Did MOV r0, #0 and RET\n");
 		}
 	}
+	return 0;
 }
 
 int patch_boot_args64(struct iboot64_img* iboot_in, char* bootargs) {
@@ -725,7 +728,6 @@ int patch_boot_args64(struct iboot64_img* iboot_in, char* bootargs) {
 		return -1;
 	}
 	LOG("Found boot-arg xref at 0x%llx\n",iboot_in->base+default_args_xref);
-	// we only do xref relocation now. its cooler that way
 	if(strlen(bootargs) > 270) {
 		char bootargCpy[271] = { '\0' }; // sorry, gotta shorten it
 		strncpy(bootargCpy,bootargs,270);
@@ -737,7 +739,6 @@ int patch_boot_args64(struct iboot64_img* iboot_in, char* bootargs) {
 	char zeros[270] = {0};
 	// cryptiiiic boot arg location
 	// https://github.com/Cryptiiiic/liboffsetfinder64/blob/4d034e5102178177e1bf9f5cc024a95651bed22b/liboffsetfinder64/ibootpatchfinder64_base.cpp#L225
-	// so much better than finding random error strings
 	new_loc = memmem(iboot_in->buf,iboot_in->len,zeros,270);
 	if(!new_loc) {
 		if (strlen(bootargs) >= 180) {
@@ -805,8 +806,7 @@ int rsa_sigcheck_patch(struct iboot64_img* iboot_in, bool pac) {
 		return -1;
 	}
 	LOG("Found IMG4 xref at 0x%llx\n",img4Ref);
-	do_rsa_sigcheck_patch(iboot_in, img4Ref, pac);
-	return 0;
+	return do_rsa_sigcheck_patch(iboot_in, img4Ref, pac);
 }
 
 int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintptr_t ptr) { // useful for kicking off iBoot payloads
@@ -864,8 +864,12 @@ int unlock_nvram(struct iboot64_img* iboot_in) {
 	addr_t debugRef = (addr_t)GET_IBOOT_FILE_OFFSET(iboot_in,debuguartRef);
 	LOG("Found debug-uarts reference at 0x%llx\n",debugRef);
 	addr_t setenvWhitelist = debugRef;
-	while(get_ptr_loc(iboot_in->buf,setenvWhitelist-=8)); // move back until we get 0x0
-	setenvWhitelist+=8; // go back up one to get to start of list
+	while(setenvWhitelist >= 8 && a64_pointer(iboot_in, setenvWhitelist - 8))
+		setenvWhitelist -= 8;
+	if(setenvWhitelist < 8 || a64_pointer(iboot_in, setenvWhitelist - 8)) {
+		WARN("Invalid setenv whitelist\n");
+		return -1;
+	}
 	LOG("setenv whitelist begins at 0x%llx\n",setenvWhitelist);
 	addr_t blacklistFunc = xref64(iboot_in->buf,0,iboot_in->len,setenvWhitelist);
 	if(!blacklistFunc) {
@@ -878,38 +882,53 @@ int unlock_nvram(struct iboot64_img* iboot_in) {
 		WARN("Could not find beginning of blacklist function\n");
 		return -1;
 	}
-	LOG("Forcing sub_%llx to return immediately\n",blacklistFuncBegin+iboot_in->base);
-	uint32_t movZeroZero = new_mov_immediate_insn(0,0,1);
-	uint32_t retInsn = new_ret_insn(-1);
-	write_opcode(iboot_in->buf,blacklistFuncBegin,movZeroZero);
-	write_opcode(iboot_in->buf,blacklistFuncBegin+4,retInsn);
 	addr_t envWhitelist = setenvWhitelist;
-	while(get_ptr_loc(iboot_in->buf,envWhitelist+=8));
+	while(envWhitelist <= iboot_in->len - 8 && a64_pointer(iboot_in, envWhitelist))
+		envWhitelist += 8;
+	if(envWhitelist > iboot_in->len - 16) {
+		WARN("Invalid end of setenv whitelist\n");
+		return -1;
+	}
 	envWhitelist += 8;
 	LOG("Found env whitelist at 0x%llx\n",envWhitelist);
 	addr_t blacklistFunc2 = xref64(iboot_in->buf,0,iboot_in->len,envWhitelist);
-	if(!blacklistFunc2) {
+	int legacy_shared_list = 0;
+	if(!blacklistFunc2 && iboot_in->VERS < 2261) {
+		static const char* const legacy[] = {"auto-boot", "boot-args", "debug-uarts", "filesize"};
+		size_t count = sizeof(legacy) / sizeof(legacy[0]);
+		legacy_shared_list = envWhitelist - setenvWhitelist == (count + 1) * 8;
+		for(size_t i = 0; legacy_shared_list && i < count; i++) {
+			uint64_t pointer = a64_pointer(iboot_in, setenvWhitelist + i * 8);
+			size_t length = strlen(legacy[i]) + 1;
+			if(pointer < iboot_in->base || pointer - iboot_in->base >= iboot_in->len ||
+				iboot_in->len - (pointer - iboot_in->base) < length ||
+				memcmp((const char *)iboot_in->buf + pointer - iboot_in->base, legacy[i], length)) {
+				legacy_shared_list = 0;
+				break;
+			}
+		}
+	}
+	if(!blacklistFunc2 && !legacy_shared_list) {
 		WARN("Could not find reference to env whitelist\n");
 		return -1;
 	}
-	LOG("Found ref to env whitelist at 0x%llx\n",blacklistFunc2);
-	addr_t blacklistFunc2Begin = bof64(iboot_in->buf,0,blacklistFunc2);
-	if(!blacklistFunc2Begin) {
-		WARN("Could not find beginning of second blacklist function\n");
-		return -1;
+	addr_t blacklistFunc2Begin = 0;
+	if(blacklistFunc2) {
+		LOG("Found ref to env whitelist at 0x%llx\n",blacklistFunc2);
+		blacklistFunc2Begin = bof64(iboot_in->buf,0,blacklistFunc2);
+		if(!blacklistFunc2Begin) {
+			WARN("Could not find beginning of second blacklist function\n");
+			return -1;
+		}
 	}
-	LOG("Forcing sub_%llx to return immediately\n",blacklistFunc2Begin+iboot_in->base);
-	write_opcode(iboot_in->buf,blacklistFunc2Begin,movZeroZero);
-	write_opcode(iboot_in->buf,blacklistFunc2Begin+4,retInsn);
 	void* comAppleSystemLoc = memmem(iboot_in->buf,iboot_in->len,"com.apple.System.",strlen("com.apple.System.")+1);
-	// strlen() + 1 because we are including the null terminator in the search 
 	if(!comAppleSystemLoc) {
 		WARN("Could not find string \"com.apple.System.\"\n");
 		return -1;
 	}
 	LOG("Found \"com.apple.System.\" string at %p\n",GET_IBOOT64_ADDR(iboot_in,comAppleSystemLoc));
 	addr_t comAppleSystemRef = iboot64_ref(iboot_in,comAppleSystemLoc);
-	if(!comAppleSystemLoc) {
+	if(!comAppleSystemRef) {
 		WARN("Could not find reference to \"com.apple.System.\"\n");
 		return -1;
 	}
@@ -918,6 +937,18 @@ int unlock_nvram(struct iboot64_img* iboot_in) {
 	if(!appleSystemFuncBegin) {
 		WARN("Unable to find beginning of function where \"com.apple.System.\" is referenced\n");
 		return -1;
+	}
+	uint32_t movZeroZero = new_mov_immediate_insn(0,0,1);
+	uint32_t retInsn = new_ret_insn(-1);
+	LOG("Forcing sub_%llx to return immediately\n",blacklistFuncBegin+iboot_in->base);
+	write_opcode(iboot_in->buf,blacklistFuncBegin,movZeroZero);
+	write_opcode(iboot_in->buf,blacklistFuncBegin+4,retInsn);
+	if(blacklistFunc2Begin) {
+		LOG("Forcing sub_%llx to return immediately\n",blacklistFunc2Begin+iboot_in->base);
+		write_opcode(iboot_in->buf,blacklistFunc2Begin,movZeroZero);
+		write_opcode(iboot_in->buf,blacklistFunc2Begin+4,retInsn);
+	} else {
+		LOG("Using the shared legacy ARM64 NVRAM whitelist\n");
 	}
 	LOG("Forcing sub_%llx to return immediately\n",appleSystemFuncBegin+iboot_in->base);
 	write_opcode(iboot_in->buf,appleSystemFuncBegin,movZeroZero);

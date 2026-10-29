@@ -54,6 +54,11 @@ static uint64_t a64_pointer(const struct iboot64_img* image, size_t p) {
 	return value;
 }
 
+static int a64_mboot(const struct iboot64_img* image) {
+	return image->len >= 0x306 &&
+		!memcmp((const uint8_t *)image->buf + 0x300, "mBoot-", 6);
+}
+
 static int64_t a64_signed(uint32_t value, unsigned bits) {
 	return (int64_t)(value & ((1u << bits) - 1)) -
 		((value & (1u << (bits - 1))) ? (1LL << bits) : 0);
@@ -484,8 +489,99 @@ static int a64_tag(const struct iboot64_img* image, size_t start,
 	return 0;
 }
 
-static int a64_sigcheck(struct iboot64_img* image) {
+static size_t a64_sigcheck_result(const struct iboot64_img* image,
+	size_t start, size_t end) {
 	size_t selected = 0;
+	for(size_t p = start; p + 4 <= end; p += 4) {
+		if(a64_word(image, p) != 0xd65f03c0 && a64_word(image, p) != 0xd65f0fff)
+			continue;
+		int frame = 0, stack = 0, result = 0;
+		for(size_t q = p; q >= start + 4 && p - q < 64;) {
+			q -= 4;
+			uint32_t op = a64_word(image, q);
+			if((op & 0xffc003e0) == 0xa94003e0 ||
+				(op & 0xffc003e0) == 0xa8c003e0) {
+				unsigned first = op & 31, second = (op >> 10) & 31;
+				if(first < 19 || first > 30 || second < 19 || second > 30)
+					break;
+				frame |= first == 29 && second == 30;
+				stack |= (op & 0xffc003e0) == 0xa8c003e0;
+				continue;
+			}
+			if((op & 0xffc003ff) == 0x910003ff) {
+				stack = 1; // ADD SP,SP,#frame_size
+				continue;
+			}
+			if(op == 0xd503201f || op == 0xd50323bf || op == 0xd50323ff)
+				continue; // NOP or authenticate the restored return address.
+			if((op & 0x7fe0ffff) == 0x2a0003e0 &&
+				((op >> 16) & 31) >= 19 && ((op >> 16) & 31) <= 28 && frame && stack) {
+				if(selected && selected != q)
+					return 0;
+				selected = q; // MOV X0/W0, saved_result, before restoring its register.
+				result = 1;
+			}
+			break;
+		}
+		if(!result)
+			return 0;
+	}
+	return selected;
+}
+
+static size_t a64_sigcheck_getter(const struct iboot64_img* image, size_t start) {
+	if(start > image->len || image->len - start < 24)
+		return 0;
+	if((a64_word(image, start) & 0xffc003e0) == 0xa9400020) {
+		/* Preserve the mBoot context bounds checks. */
+		if(image->len - start < 40)
+			return 0;
+		uint32_t pair = a64_word(image, start), bound = a64_word(image, start + 4);
+		unsigned context = pair & 31, limit = (pair >> 10) & 31;
+		unsigned endreg = bound & 31;
+		if((pair & 0xffc003e0) != 0xa9400020 ||
+			(bound & 0xffc003e0) != 0xf9400020 ||
+			((bound >> 10) & 0xfff) != 6 || ((pair >> 15) & 0x7f) != 4 ||
+			context == 31 || limit == 31 || endreg == 31 ||
+			a64_word(image, start + 8) !=
+				(0xeb00001f | (context << 5) | (limit << 16)) ||
+			a64_word(image, start + 12) !=
+				(0xfa402002 | (context << 5) | (endreg << 16)) ||
+			(a64_word(image, start + 16) & 0xff00001f) != 0x54000002)
+			return 0;
+		uint32_t flag = a64_word(image, start + 20), address = a64_word(image, start + 24);
+		uint32_t compare = a64_word(image, start + 28), select = a64_word(image, start + 32);
+		unsigned value = flag & 31;
+		if((flag & 0xffc003e0) != (0x39400000 | (context << 5)) || value == 31 ||
+			(address & 0xffc003ff) != (0x91000000 | (context << 5) | context) ||
+			((address >> 10) & 0xfff) != ((flag >> 10) & 0xfff) + 1 ||
+			compare != (0x7100001f | (value << 5)) ||
+			select != (0x9a9f1000 | (context << 5)) ||
+			a64_word(image, start + 36) != 0xd65f03c0)
+			return 0;
+		return start + 32;
+	}
+	uint32_t load = a64_word(image, start), flag = a64_word(image, start + 4);
+	uint32_t address = a64_word(image, start + 8), compare = a64_word(image, start + 12);
+	uint32_t select = a64_word(image, start + 16);
+	unsigned context = load & 31, pointer = address & 31;
+	if((load & 0xffc003e0) != 0xf9400020 || context == 31 ||
+		(flag & 0xffc00000) != 0x39400000 || ((flag >> 5) & 31) != context ||
+		(flag & 31) == 31 || (flag & 31) == context || (flag & 31) == pointer ||
+		(address & 0xffc00000) != 0x91000000 || ((address >> 5) & 31) != context ||
+		pointer == 31 || (compare & 0xfffffc1f) != 0x7100001f ||
+		((compare >> 5) & 31) != (flag & 31) ||
+		(select & 0xffe00c1f) != 0x9a800000 || ((select >> 12) & 15) > 1 ||
+		a64_word(image, start + 20) != 0xd65f03c0)
+		return 0;
+	unsigned first = (select >> 5) & 31, second = (select >> 16) & 31;
+	if(!((first == pointer && second == 31) || (first == 31 && second == pointer)))
+		return 0;
+	return start + 16; // Preserve the context reads, replace only the selected result.
+}
+
+static int a64_sigcheck(struct iboot64_img* image) {
+	size_t selected = 0, selected_getter = 0;
 	for(size_t p = 0x340; p + 4 <= image->len; p += 4) {
 		unsigned reg;
 		size_t table, width;
@@ -493,6 +589,12 @@ static int a64_sigcheck(struct iboot64_img* image) {
 			(table & 7) || image->len - table < 24 || a64_pointer(image, table + 16))
 			continue;
 		uint64_t pointer = a64_pointer(image, table), next = a64_pointer(image, table + 8);
+		if(a64_mboot(image)) {
+			if(!(pointer >> 32) || !(next >> 32))
+				continue;
+			pointer = image->base + (uint32_t)pointer;
+			next = image->base + (uint32_t)next;
+		}
 		if(pointer < image->base || pointer - image->base >= image->len ||
 			next < image->base || next - image->base >= image->len || (pointer & 3) || (next & 3))
 			continue;
@@ -519,23 +621,29 @@ static int a64_sigcheck(struct iboot64_img* image) {
 		}
 		if(!stack_context || !call)
 			continue;
-		if(selected && selected != callback) {
+		size_t result = a64_sigcheck_result(image, callback, end);
+		size_t getter = a64_sigcheck_getter(image, end);
+		if(!result || !getter)
+			continue;
+		if(selected && (selected != result || selected_getter != getter)) {
 			WARN("Ambiguous ARM64 IMG4 property callback\n");
 			return -1;
 		}
-		selected = callback;
+		selected = result;
+		selected_getter = getter;
 	}
 	if(!selected) {
 		WARN("Could not validate ARM64 IMG4 property callback\n");
 		return -1;
 	}
 	write_opcode(image->buf, selected, 0xd2800000); // MOV X0,#0
-	write_opcode(image->buf, selected + 4, 0xd65f03c0); // RET
-	LOG("Patched ARM64 IMG4 property callback at 0x%zx\n", selected);
+	write_opcode(image->buf, selected_getter, 0xd2800000); // MOV X0,#0
+	LOG("Patched ARM64 IMG4 callback result at 0x%zx and getter result at 0x%zx\n",
+		selected, selected_getter);
 	return 0;
 }
 
-static int a64_bootargs_context(const struct iboot64_img* image, size_t copy) {
+static int a64_bootargs_context(const struct iboot64_img* image, size_t copy, unsigned format_register) {
 	const uint8_t* b = image->buf;
 	size_t restore = 0, ramdisk = 0;
 	size_t start = copy > 0x800 ? copy - 0x800 : 0x340;
@@ -544,9 +652,9 @@ static int a64_bootargs_context(const struct iboot64_img* image, size_t copy) {
 		size_t target, width;
 		if(!a64_address(image, p, &reg, &target, &width))
 			continue;
-		if(reg == 4 && image->len - target >= 6 && !memcmp(b + target, "rd=md0", 6))
+		if(reg == (format_register == 2 ? 2 : 4) && image->len - target >= 6 && !memcmp(b + target, "rd=md0", 6))
 			ramdisk = p;
-		if(reg == 1 && image->len - target >= 10 && !memcmp(b + target, " -restore\0", 10))
+		if(reg == (format_register == 2 ? 4 : 1) && image->len - target >= 10 && !memcmp(b + target, " -restore\0", 10))
 			restore = p;
 	}
 	size_t function = a64_function(image, copy);
@@ -557,6 +665,7 @@ static int a64_bootargs_context(const struct iboot64_img* image, size_t copy) {
 static int a64_bootargs(struct iboot64_img* image, const char* args) {
 	const uint8_t* b = image->buf;
 	size_t length = strlen(args), selected = 0, selected_width = 0;
+	unsigned selected_register = 0;
 	if(length > 270) {
 		WARN("Boot arguments exceed 270 bytes\n");
 		return -1;
@@ -564,10 +673,28 @@ static int a64_bootargs(struct iboot64_img* image, const char* args) {
 	for(size_t p = 0x340; p + 12 <= image->len; p += 4) {
 		unsigned reg;
 		size_t target, width;
-		if(!a64_address(image, p, &reg, &target, &width) || reg != 4 ||
+		if(!a64_address(image, p, &reg, &target, &width) || (reg != 2 && reg != 4) ||
 			image->len - target < 3 || memcmp(b + target, "%s\0", 3))
 			continue;
 		size_t store = p + width;
+		if(reg == 2) {
+			/* The bounded snprintf wrapper takes its format in X2. */
+			if(store + 12 > image->len ||
+				((a64_word(image, store) & 0xffc003ff) != 0x910003e0 &&
+				 (a64_word(image, store) & 0xffc003ff) != 0xd10003a0) ||
+				a64_word(image, store + 4) != 0x52808001 ||
+				(a64_word(image, store + 8) & 0xfc000000) != 0x94000000 ||
+				!a64_bootargs_context(image, p, reg))
+				continue;
+			if(selected) {
+				WARN("Ambiguous mBoot boot-args formatting call\n");
+				return -1;
+			}
+			selected = p;
+			selected_width = width;
+			selected_register = reg;
+			continue;
+		}
 		if(a64_word(image, store) == 0xd503201f)
 			store += 4;
 		if(store + 12 > image->len ||
@@ -578,7 +705,7 @@ static int a64_bootargs(struct iboot64_img* image, const char* args) {
 			call += 4; // MOV X0,Xn
 		if((a64_word(image, call) & 0xfc000000) != 0x94000000)
 			continue;
-		if(!a64_bootargs_context(image, p))
+		if(!a64_bootargs_context(image, p, reg))
 			continue;
 		if(selected) {
 			WARN("Ambiguous ARM64 boot-args formatting call\n");
@@ -586,6 +713,7 @@ static int a64_bootargs(struct iboot64_img* image, const char* args) {
 		}
 		selected = p;
 		selected_width = width;
+		selected_register = reg;
 	}
 	if(!selected) {
 		WARN("Could not validate ARM64 boot-args formatting call\n");
@@ -617,7 +745,7 @@ static int a64_bootargs(struct iboot64_img* image, const char* args) {
 		return -1;
 	}
 	memcpy((uint8_t *)image->buf + storage, format, used);
-	write_opcode(image->buf, selected, new_insn_adr(selected, 4, storage));
+	write_opcode(image->buf, selected, new_insn_adr(selected, selected_register, storage));
 	if(selected_width == 8)
 		write_opcode(image->buf, selected + 4, 0xd503201f);
 	LOG("Patched ARM64 boot-args format at 0x%zx, string at 0x%zx\n", selected, storage);
@@ -658,6 +786,25 @@ static int a64_debug(struct iboot64_img* image) {
 	return 0;
 }
 
+/* NVRAM name arrays can follow command records without a NULL separator. */
+static int a64_nvram_name(const struct iboot64_img* image, size_t p) {
+	if(p > image->len || image->len - p < 8)
+		return 0;
+	uint64_t pointer = a64_pointer(image, p);
+	if(pointer < image->base || pointer - image->base >= image->len)
+		return 0;
+	size_t start = (size_t)(pointer - image->base);
+	const uint8_t* bytes = image->buf;
+	for(size_t n = 0; n < 128 && n < image->len - start; n++) {
+		unsigned c = bytes[start + n];
+		if(!c)
+			return n != 0;
+		if(c <= 0x20 || c >= 0x7f)
+			return 0;
+	}
+	return 0;
+}
+
 static int a64_nvram(struct iboot64_img* image) {
 	const uint8_t* b = image->buf;
 	const char name[] = "debug-uarts";
@@ -670,11 +817,11 @@ static int a64_nvram(struct iboot64_img* image) {
 		if(image->len - s < sizeof(name) || memcmp(b + s, name, sizeof(name)))
 			continue;
 		size_t start = p, end = p;
-		while(start >= 8 && p - start < 2048 && a64_pointer(image, start - 8))
+		while(start >= 8 && p - start < 2048 && a64_nvram_name(image, start - 8))
 			start -= 8;
-		if(start < 8 || a64_pointer(image, start - 8))
+		if(start < 8 || a64_nvram_name(image, start - 8))
 			continue;
-		while(end + 16 <= image->len && end - p < 2048 && a64_pointer(image, end))
+		while(end + 16 <= image->len && end - p < 2048 && a64_nvram_name(image, end))
 			end += 8;
 		if(end + 16 > image->len || a64_pointer(image, end))
 			continue;
@@ -748,6 +895,24 @@ uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in) {  // modified f
 	uint32_t offset = 0x318;
 	get_iboot64_version(iboot_in);
 	if(iboot_in->buf) {
+		/* mBoot stores its linked base in a startup relocation literal. */
+		if(iboot_in->len >= 0x340 &&
+			!memcmp((uint8_t *)iboot_in->buf + 0x300, "mBoot-", 6)) {
+			uint32_t load = a64_word(iboot_in, 8);
+			int64_t literal = 8 + a64_signed((load >> 5) & 0x7ffff, 19) * 4;
+			if(a64_word(iboot_in, 0) != 0x90000000 ||
+				a64_word(iboot_in, 4) != 0x91000000 ||
+				(load & 0xff00001f) != 0x58000001 ||
+				(a64_word(iboot_in, 12) & 0xfc000000) != 0x94000000 ||
+				a64_word(iboot_in, 16) != 0xeb00003f ||
+				literal < 0x340 || (uint64_t)literal > iboot_in->len - 8)
+				return 0;
+			uint64_t base = a64_pointer(iboot_in, (size_t)literal);
+			if(base < UINT64_C(0x100000000) || base >= (UINT64_C(1) << 48) || (base & 0xfff))
+				return 0;
+			iboot_in->base = base;
+			return base;
+		}
 		if(iboot_in->VERS >= 6603) // as of iOS 14, the base address appears to have been moved to 0x300
 			offset = 0x300;
 		iboot_in->base = *(uint64_t*)(iboot_in->buf + offset);
@@ -759,6 +924,9 @@ uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in) {  // modified f
 
 uint32_t get_iboot64_version(struct iboot64_img* iboot_in) {
 	const char* version = memmem(iboot_in->buf, iboot_in->len, "iBoot-", 6);
+	if(!version && iboot_in->len >= 0x306 &&
+		!memcmp((uint8_t *)iboot_in->buf + 0x300, "mBoot-", 6))
+		version = (const char *)iboot_in->buf + 0x300;
 	iboot_in->VERS = 0;
 	iboot_in->minor_vers = 0;
 	if(!version)

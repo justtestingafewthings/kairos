@@ -1,18 +1,28 @@
 ifeq ($(OS),Windows_NT)
 	detected_OS := Windows
+	TARGET := kairos.exe
 else
-	detected_OS := $(shell sh -c 'uname 2>/dev/null || echo unknown')
+	detected_OS := $(shell uname 2>/dev/null || echo unknown)
+	TARGET := kairos
 endif
 
-all:
-ifeq ($(detected_OS),Darwin)
-		gcc main.c watchimage.c watchpatch.c watchoptions.c patchfinder64.c newpatch.c decoders.c instructions.c -Iinclude -o kairos
-else
-		gcc main.c watchimage.c watchpatch.c watchoptions.c patchfinder64.c newpatch.c decoders.c instructions.c -Iinclude -DNOT_DARWIN -o kairos
+CPPFLAGS += -Iinclude -Iarm32
+ifneq ($(detected_OS),Darwin)
+CPPFLAGS += -DNOT_DARWIN
 endif
+CFLAGS += -Wno-multichar
+
+SOURCES := main.c imageio.c arm32_dispatch.c \
+	arm32/driver.c arm32/finders.c arm32/functions.c arm32/patchers.c \
+	dfuuart.c kaslr64.c watchkaslr.c watchimage.c watchpatch.c watchoptions.c \
+	patchfinder64.c newpatch.c decoders.c instructions.c
+HEADERS := $(wildcard include/*.h arm32/include/*.h)
+
+.PHONY: all clean
+all: $(TARGET)
+
+$(TARGET): $(SOURCES) $(HEADERS) Makefile
+	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SOURCES) $(LDLIBS)
+
 clean:
-ifeq ($(detected_OS),Windows)
-		rm kairos.exe
-else
-		rm kairos
-endif
+	$(RM) kairos kairos.exe

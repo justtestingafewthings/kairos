@@ -23,16 +23,31 @@
 #include "watchoptions.h"
 #include "watchpatch.h"
 #include <errno.h>
+#include <inttypes.h>
+#include "arm32.h"
+#include "imageio.h"
+#include "dfuuart.h"
+#include "kaslr64.h"
+#include "watchkaslr.h"
 
 int main(int argc, char* argv[]) {
+	if(argc >= 3 && kairos_arm32_probe(argv[1]))
+		return kairos_arm32_main(argc, argv);
 	if(argc < 3) {
 		printf("Incorrect usage\nusage: %s [deciBoot] [patchediBoot] [OPTIONS]\n",argv[0]);
 		printf("Options:\n\t-b [args]\t\tset boot-args\n");
+		printf("\t-r, --rsa\t\tremove RSA signature checks\n");
+		printf("\t-d, --debug\t\tenable kernel debug (kernel-loading images)\n");
+		printf("\t--early-uart\t\t\tenable early DFU UART (iBSS/iLLB)\n");
+		printf("\t--disable-kaslr\t\tdisable kernel address randomization (iOS 6+)\n");
+		printf("ARM32 options: --ticket -a --local-boot --remote-boot\n");
+		printf("\t--boot-partition --boot-ramdisk --setenv\n");
+		printf("\t--logo --logo4 --433 --dualboot\n");
 		printf("\t-c [cmd] [location]\trelocate command handler\n");
 		printf("\t-n\t\t\tunlock nvram\n");
 		printf("\t-f, --fresh-nonce\tbypass cached nonce (requires a saved boot-nonce generator)\n");
 		printf("\t--fresh-nonce-only\tadd only the nonce patch to an already patched image\n");
-		printf("\nExample usage:\n%s iBEC.dec iBEC.patched -n -b \"-v debug=0x09\" -c \"go\" 0x830000300\n",argv[0]);
+		printf("\nExample usage:\n%s iBEC.dec iBEC.patched -r -d -n -b \"-v debug=0x09\" -c \"go\" 0x830000300\n",argv[0]);
 		return -1;
 	}
 	
@@ -47,6 +62,10 @@ int main(int argc, char* argv[]) {
 	bool doNvramUnlock = false;
 	bool doFreshNonce = false;
 	bool freshNonceOnly = false;
+	bool doUart = false;
+	bool doKaslr = false;
+	bool doDebug = false;
+	bool doRsa = false;
 
 	for(int i = 3; i < argc; i++) {
 		if(!strcmp(argv[i], "-b") && i + 1 < argc) {
@@ -57,10 +76,18 @@ int main(int argc, char* argv[]) {
 			const char* address = argv[++i];
 			errno = 0;
 			command_ptr = strtoull(address, &end, 0);
-			if(errno || end == address || *end || address[0] == '-' || !command_ptr) {
+			if(errno || end == address || *end || address[0] < '0' || address[0] > '9' || !command_ptr) {
 				WARN("Invalid command handler address: %s\n", address);
 				return 1;
 			}
+		} else if(!strcmp(argv[i], "-r") || !strcmp(argv[i], "--rsa")) {
+			doRsa = true;
+		} else if(!strcmp(argv[i], "-d") || !strcmp(argv[i], "--debug")) {
+			doDebug = true;
+		} else if(!strcmp(argv[i], "--early-uart")) {
+			doUart = true;
+		} else if(!strcmp(argv[i], "--disable-kaslr")) {
+			doKaslr = true;
 		} else if(!strcmp(argv[i], "-n")) {
 			doNvramUnlock = true;
 		} else if(!strcmp(argv[i], "-f") || !strcmp(argv[i], "--fresh-nonce")) {
@@ -73,10 +100,16 @@ int main(int argc, char* argv[]) {
 			return 1;
 		}
 	}
-	if(freshNonceOnly && (doNvramUnlock || bootArgs || command_str)) {
+	if(command_str && !*command_str) {
+		WARN("Command name cannot be empty\n");
+		return 1;
+	}
+	if(freshNonceOnly && (doNvramUnlock || bootArgs || command_str || doUart || doKaslr || doDebug || doRsa)) {
 		WARN("--fresh-nonce-only cannot be combined with other patch options\n");
 		return 1;
 	}
+	if(kairos_check_paths(inFile, outFile))
+		return 1;
 	FILE* fp = fopen(inFile,"rb");
 	if(!fp) {
 		printf("Error opening %s for reading\n",inFile);
@@ -119,6 +152,16 @@ int main(int argc, char* argv[]) {
 		get_iboot64_version(&iboot_in);
 		LOG("ARMv7 Thumb Watch bootloader, base 0x%08x, iBoot-%u.%u\n", base, iboot_in.VERS,
 			iboot_in.minor_vers);
+		if((bootArgs || doKaslr || doDebug) && !has_kernel_load_k(&iboot_in)) {
+			WARN("Requested options require a kernel-loading Watch bootloader\n");
+			goto patch_failed;
+		}
+		if((command_str || doNvramUnlock) && !has_recovery_console_k(&iboot_in)) {
+			WARN("Requested options require a Watch recovery console\n");
+			goto patch_failed;
+		}
+		if(doUart && dfu_uart_patch(iboot_in.buf, iboot_in.len))
+			goto patch_failed;
 		if(doFreshNonce && (!has_kernel_load_k(&iboot_in) || !has_recovery_console_k(&iboot_in))) {
 			WARN("Fresh nonce patch requires a kernel-loading recovery bootloader\n");
 			goto patch_failed;
@@ -129,16 +172,24 @@ int main(int argc, char* argv[]) {
 		}
 		if(freshNonceOnly)
 			goto write_output;
-		ret = watch_sigcheck_patch(&iboot_in);
-		if(ret < 0)
-			goto patch_failed;
+		if(doRsa) {
+			ret = watch_sigcheck_patch(&iboot_in);
+			if(ret < 0)
+				goto patch_failed;
+		}
 		if(has_kernel_load_k(&iboot_in)) {
+			if(doKaslr && watch_disable_kaslr(&iboot_in) < 0) {
+				WARN("Failed to disable Watch kernel address randomization\n");
+				goto patch_failed;
+			}
 			if(bootArgs && watch_bootargs_patch(&iboot_in, bootArgs) < 0) {
 				WARN("Failed to patch Thumb boot arguments\n");
 				goto patch_failed;
 			}
-			if(watch_debug_patch(&iboot_in) < 0)
+			if(doDebug && watch_debug_patch(&iboot_in) < 0) {
 				WARN("Could not enable Thumb kernel debug\n");
+				goto patch_failed;
+			}
 		}
 		if(has_recovery_console_k(&iboot_in)) {
 			if(command_str && watch_command_patch(&iboot_in, command_str, command_ptr) < 0) {
@@ -152,13 +203,27 @@ int main(int argc, char* argv[]) {
 		}
 		goto write_output;
 	}
+	if(doUart && dfu_uart_patch(iboot_in.buf, iboot_in.len))
+		goto patch_failed;
 	if((reset & 0xff000000) == 0xea000000 ||
 		!memcmp((uint8_t *)iboot_in.buf + 4, "\x18\xf0\x9f\xe5", 4) ||
 		!get_iboot64_version(&iboot_in)) {
 		WARN("Unsupported or invalid unpacked bootloader\n");
 		goto patch_failed;
 	}
-	LOG("Base address: 0x%llx\n",get_iboot64_base_address(&iboot_in));
+	if(!get_iboot64_base_address(&iboot_in)) {
+		WARN("Unsupported ARM64 bootloader base-address layout\n");
+		goto patch_failed;
+	}
+	LOG("Base address: 0x%" PRIx64 "\n",iboot_in.base);
+	if((bootArgs || doKaslr || doDebug) && !has_kernel_load_k(&iboot_in)) {
+		WARN("Requested options require a kernel-loading ARM64 bootloader\n");
+		goto patch_failed;
+	}
+	if((command_str || doNvramUnlock) && !has_recovery_console_k(&iboot_in)) {
+		WARN("Requested options require a ARM64 recovery console\n");
+		goto patch_failed;
+	}
 	if(doFreshNonce && (!has_kernel_load_k(&iboot_in) || !has_recovery_console_k(&iboot_in))) {
 		WARN("Fresh nonce patch requires a kernel-loading recovery bootloader\n");
 		goto patch_failed;
@@ -169,9 +234,13 @@ int main(int argc, char* argv[]) {
 	}
 	if(freshNonceOnly)
 		goto write_output;
-	bool pac = iboot64_pac_check(&iboot_in);
+	bool pac = doRsa && iboot64_pac_check(&iboot_in);
 	if(has_kernel_load_k(&iboot_in)) {
 		LOG("Does have kernel load\n");
+		if(doKaslr && arm64_disable_kaslr(&iboot_in) < 0) {
+			WARN("Failed to disable ARM64 kernel address randomization\n");
+			goto patch_failed;
+		}
 		if(bootArgs) {
 			LOG("Patching boot-args...\n");
 			ret = patch_boot_args64(&iboot_in,bootArgs);
@@ -180,14 +249,18 @@ int main(int argc, char* argv[]) {
 				goto patch_failed;
 			}
 		}
-		LOG("Enabling kernel debug...\n");
-		ret = enable_kernel_debug(&iboot_in);
-		if(ret < 0)
-			WARN("Could not enable kernel debug\n");
+		if(doDebug) {
+			LOG("Enabling kernel debug...\n");
+			ret = enable_kernel_debug(&iboot_in);
+			if(ret < 0) {
+				WARN("Could not enable kernel debug\n");
+				goto patch_failed;
+			}
+		}
 	}
 	if(has_recovery_console_k(&iboot_in)) {
 		if(command_str && (command_ptr != 0)) {
-			LOG("Changing command handler %s to 0x%llx...\n",command_str,command_ptr);
+			LOG("Changing command handler %s to 0x%" PRIx64 "...\n",command_str,command_ptr);
 			ret = do_command_handler_patch(&iboot_in,command_str,command_ptr);
 			if(ret < 0) {
 				WARN("Failed to patch command handler for %s\n",command_str);
@@ -203,32 +276,19 @@ int main(int argc, char* argv[]) {
 			}
 		}
 	}
-	LOG("Patching out RSA signature check...\n");
-	ret = rsa_sigcheck_patch(&iboot_in, pac);
-	if(ret < 0)
-		goto patch_failed;
+	if(doRsa) {
+		LOG("Patching out RSA signature check...\n");
+		ret = rsa_sigcheck_patch(&iboot_in, pac);
+		if(ret < 0)
+			goto patch_failed;
+	}
 
 write_output:
-	fp = fopen(outFile,"wb+");
-	if(!fp) {
-		printf("Error opening %s for writing\n",outFile);
-		free(iboot_in.buf);
-		return -1;
-	}
-	if(fwrite(iboot_in.buf, 1, iboot_in.len, fp) != iboot_in.len || fflush(fp)) {
-		WARN("Error writing %s\n", outFile);
-		fclose(fp);
-		free(iboot_in.buf);
-		return 1;
-	}
-	if(fclose(fp)) {
-		WARN("Error closing %s\n", outFile);
-		free(iboot_in.buf);
-		return 1;
-	}
+	ret = kairos_write_image(inFile, outFile, iboot_in.buf, iboot_in.len);
 	free(iboot_in.buf);
-	LOG("Wrote patched image to %s\n",outFile);
-	return 0;
+	if(!ret)
+		LOG("Wrote patched image to %s\n",outFile);
+	return ret;
 
 patch_failed:
 	WARN("Patching failed; output was not written\n");

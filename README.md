@@ -2,15 +2,19 @@ kairos
 ======
 kairos is an iBoot image patcher written in C.
 
-Support for iOS 7 - 18, watchOS 1 - 8, and tvOS 9 - 26.
+Supports ARM32 and ARM64 iBoot images.
 
 Patches include:
-* RSA signature check removal
-* boot-arg modification
-* enabling of kernel debug
-* command handler modification
-* NVRAM unlock
-* nonce cache bypass and generator preservation
+
+* RSA signature check removal (`-r` / `--rsa`)
+* boot arguments (`-b`, or `-a` for the ARM32 bootloader environment)
+* kernel debug (`-d` / `--debug`)
+* command handler modification (`-c`)
+* kernel address randomization removal (`--disable-kaslr`, iOS 6+)
+* early iBSS/LLB UART initialization (`--early-uart`)
+* ARM32 ticket, boot mode, partition, ramdisk, environment, logo and dualboot patches
+* NVRAM unlock (`-n`, ARM64 and Watch)
+* nonce cache bypass and generator preservation (`-f`, ARM64 and Watch)
 
 Why?
 ----
@@ -22,8 +26,10 @@ Building
 
 Example usage
 -------------
-	./kairos iBEC.dec iBEC.patched -n -b "-v debug=0x09" -c "go" 0x830000300
-Note: the input boot image file must be decrypted and unpacked
+
+```sh
+./kairos iBEC.dec iBEC.patched -r -d -n -b "-v debug=0x09" -c "go" 0x830000300
+```
 
 Credits
 -------

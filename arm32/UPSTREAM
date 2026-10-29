@@ -1,0 +1,6 @@
+iBoot32Patcher
+https://github.com/Merculous/iBoot32Patcher
+Revision: bb5ebc45f17b57083319f24de1c4f518e0dfa57a
+Copyright 2013-2016 iH8sn0w and contributors; GPL-3.0-or-later.
+Imported patch finders/functions retain their original notices.
+Kairos integration prefixes symbols with ib32_ and uses its own CLI/I/O driver.

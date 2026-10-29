@@ -49,6 +49,10 @@ static int string_pointers(const uint8_t* b, size_t table, uint32_t base) {
 		image_word(b, 0x20) == base + 0x40;
 }
 
+int watch_image_target(const uint8_t* b, size_t n) {
+	return b && n >= 0x340 && watch_board(b);
+}
+
 int watch_image_info(const uint8_t* b, size_t n, uint32_t* base) {
 	uint32_t address;
 	if(!b || n < 0x340 || image_word(b, 0) != 0xea00000e ||

@@ -967,6 +967,22 @@ int change_bootarg_adr_xref_addr(struct iboot64_img* iboot_in, addr_t dest, addr
 	if(type == unknown) {
 		return -1;
 	}
+	if(type == add && dest >= 4 && dest <= iboot_in->len - 4) {
+		uint32_t page = get_insn(iboot_in->buf,dest - 4);
+		uint8_t reg = get_rd(insn);
+		int64_t target = (int64_t)(address - (addr_t)iboot_in->buf);
+		int64_t distance = target - (int64_t)(dest - 4);
+		if(get_type(page) != adrp || get_rd(page) != reg || get_rn(insn) != reg ||
+		   (insn & 0xffc00000) != 0x91000000 ||
+		   distance < -(1LL << 20) || distance >= (1LL << 20))
+			return -1;
+		uint32_t replacement = new_insn_adr(dest - 4,reg,target);
+		if(replacement == (uint32_t)-1) return -1;
+		write_opcode(iboot_in->buf,dest - 4,replacement);
+		write_opcode(iboot_in->buf,dest,new_nop());
+		LOG("Relocated boot-arg ADRP/ADD at 0x%llx to ADR X%u\n",(unsigned long long)(dest - 4),reg);
+		return 1;
+	}
 	if(type == adr || type == nop) {
 		uint32_t newAdr = 0;
 		if ((iboot_in->VERS == 6723 && iboot_in->minor_vers >= 100) || iboot_in->VERS >= 7429) {
@@ -1285,6 +1301,20 @@ int patch_boot_args64(struct iboot64_img* iboot_in, char* bootargs) {
 	if (ret < 0)
 		return -1;
 	strncpy(new_loc,bootargs,strlen(bootargs)+num); // main part done. also no null terminator. don't like those
+	if(ret == 1) {
+		uint8_t reg=get_rd(get_insn(iboot_in->buf,default_args_xref - 4));
+		addr_t limit=default_args_xref + 0x20;
+		if(limit > iboot_in->len) limit=iboot_in->len;
+		for(addr_t at=default_args_xref + 4;at + 4 <= limit;at += 4) {
+			uint32_t choice=get_insn(iboot_in->buf,at);
+			if(get_type(choice) != csel) continue;
+			if(get_rn(choice) != reg && get_rm(choice) != reg) return -1;
+			write_opcode(iboot_in->buf,at,new_mov_register_insn(get_rd(choice),-1,reg,0));
+			LOG("Selected relocated boot arguments at 0x%llx\n",(unsigned long long)at);
+			return 0;
+		}
+		return -1;
+	}
 	// now to patch up
 	return doFinalBootArgs(iboot_in,default_args_xref,(unsigned long long)new_loc);
 }

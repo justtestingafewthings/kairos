@@ -38,7 +38,7 @@ int main(int argc, char* argv[]) {
 		printf("Options:\n\t-b [args]\t\tset boot-args\n");
 		printf("\t-r, --rsa\t\tremove RSA signature checks\n");
 		printf("\t-d, --debug\t\tenable kernel debug (kernel-loading images)\n");
-		printf("\t--early-uart\t\t\tenable early DFU UART (iBSS/iLLB)\n");
+		printf("\t--early-uart\t\t\tenable early DFU UART (iBSS/iLLB, iOS 5+)\n");
 		printf("\t--disable-kaslr\t\tdisable kernel address randomization (iOS 6+)\n");
 		printf("ARM32 options: --ticket -a --local-boot --remote-boot\n");
 		printf("\t--boot-partition --boot-ramdisk --setenv\n");

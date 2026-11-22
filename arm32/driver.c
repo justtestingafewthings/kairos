@@ -99,6 +99,14 @@ int kairos_arm32_main(int argc, char **argv) {
     if (!os) {
         fputs("Unsupported ARM32 iBoot generation; expected iPhone OS 1 through iOS 10\n", stderr); goto failure;
     }
+    if (uart && os < 5) {
+        if (!memcmp(bytes + 0x200, "SecureROM for s5l8900xwtf",
+                    sizeof("SecureROM for s5l8900xwtf") - 1))
+            fputs("WTF does not support --early-uart\n", stderr);
+        else
+            fputs("Pre-iOS 5 iBSS already logs to UART; --early-uart is unsupported\n", stderr);
+        goto failure;
+    }
     if (kaslr && os < 6) {
         fputs("Kernel address randomization requires iOS 6 or later\n", stderr); goto failure;
     }

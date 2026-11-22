@@ -11,7 +11,7 @@ Patches include:
 * kernel debug (`-d` / `--debug`)
 * command handler modification (`-c`)
 * kernel address randomization removal (`--disable-kaslr`, iOS 6+)
-* early iBSS/LLB UART initialization (`--early-uart`)
+* early iBSS/LLB UART initialization (`--early-uart`, iOS 5+)
 * ARM32 ticket, boot mode, partition, ramdisk, environment, logo and dualboot patches
 * NVRAM unlock (`-n`, ARM64 and Watch)
 * nonce cache bypass and generator preservation (`-f`, ARM64 and Watch)

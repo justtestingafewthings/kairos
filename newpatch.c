@@ -586,7 +586,10 @@ static int a64_sigcheck(struct iboot64_img* image) {
 		unsigned reg;
 		size_t table, width;
 		if(!a64_address(image, p, &reg, &table, &width) || reg != 2 ||
-			(table & 7) || image->len - table < 24 || a64_pointer(image, table + 16))
+			(table & 7) || image->len - table < 24 ||
+			(a64_pointer(image, table + 16) &&
+			 !(image->VERS >= 4513 && image->VERS < 5540 &&
+			   a64_pointer(image, table + 16) == UINT64_MAX)))
 			continue;
 		uint64_t pointer = a64_pointer(image, table), next = a64_pointer(image, table + 8);
 		if(a64_mboot(image)) {
@@ -1309,7 +1312,10 @@ int enable_kernel_debug(struct iboot64_img* iboot_in) {
 }
 
 int rsa_sigcheck_patch(struct iboot64_img* iboot_in, bool pac) {
-	if(iboot_in->VERS >= 7429)
+	/* iOS 12 arm64e callbacks return with RETAB. The legacy RET scan
+	 * otherwise runs into the following property getter. */
+	if(iboot_in->VERS >= 7429 ||
+		(pac && iboot_in->VERS >= 4513 && iboot_in->VERS < 5540))
 		return a64_sigcheck(iboot_in);
 	void* img4Loc = NULL;
 	img4Loc = memmem(iboot_in->buf,iboot_in->len,"IMG4\0",5);

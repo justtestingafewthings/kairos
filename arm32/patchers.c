@@ -917,12 +917,30 @@ int ib32_patch_boot_mode(struct iboot_img* iboot_in, int mode) {
     return 1;
 }
 
+static uint16_t ib32_ticket_halfword(const unsigned char *p) {
+    return (uint16_t)p[0] | (uint16_t)p[1] << 8;
+}
+
+static bool ib32_ticket_call_shape(const unsigned char *p) {
+    uint16_t load = ib32_ticket_halfword(p);
+    unsigned int reg = (load >> 8) & 7;
+    if ((load & 0xf800) != 0x4800 || reg > 1) return false;
+
+    bool stack_arg = false, size_arg = false, dereference = false;
+    for (size_t i = 2; i <= 6; i += 2) {
+        uint16_t insn = ib32_ticket_halfword(p + i);
+        if ((insn & 0xff00) == 0xa900) stack_arg = true;
+        if (insn == 0x2240 || insn == 0x2280) size_arg = true;
+        if (insn == (uint16_t)(0x6800 | (reg << 3))) dereference = true;
+    }
+    return stack_arg && size_arg && dereference;
+}
+
 int ib32_patch_ticket_check(struct iboot_img* iboot_in) {
 #define pointer(p) (__pointer[0] = (uint32_t)p & 0xff, __pointer[1] = ((uint32_t)p/0x100) & 0xff, __pointer[2] = ((uint32_t)p/0x10000) & 0xff, __pointer[3] = ((uint32_t)p/0x1000000) & 0xff, _pointer)
     char __pointer[4];
     char *_pointer = __pointer;
     printf("%s: Entering...\n", __FUNCTION__);
-    char *bl_stack_fail = NULL;
     char *NOPstart = NULL;
     char *NOPstop = NULL;
 
@@ -944,27 +962,41 @@ int ib32_patch_ticket_check(struct iboot_img* iboot_in) {
     printf("%s: Found str_pointer at %p\n", __FUNCTION__, (void*) IB32_FILE_OFFSET(iboot_in, str_pointer));
 
     uint32_t str_pointer_iboot = (uint32_t)IB32_ADDRESS(iboot_in,str_pointer);
-    char *iboot_str_3_xref = iboot_in->buf;
-    for (int i=0; i<3; i++) {
-        if (!(iboot_str_3_xref = MEMMEM_RELATIVE(iboot_in, iboot_str_3_xref+1, pointer(str_pointer_iboot), 4))){
-            printf("%s: Unable to find %d iboot_str_3_xref!\n", __FUNCTION__,i+1);
-            return 0;
+    unsigned char *bytes = iboot_in->buf;
+    char *iboot_str_xref = NULL;
+    char *ldr_intruction = NULL;
+    const char *needle = pointer(str_pointer_iboot);
+    /* The version pointer has several users. Select the verifier's literal
+       load by checking its exact target and the following call sequence. */
+    for (size_t ref = 0; ref + 4 <= iboot_in->len; ref++) {
+        if (memcmp(bytes + ref, needle, 4)) continue;
+        size_t first = ref > 0x100 ? ref - 0x100 : 0;
+        first = (first + 1) & ~(size_t)1;
+        for (size_t at = first; at + 12 <= iboot_in->len && at + 2 <= ref; at += 2) {
+            uint16_t load = ib32_ticket_halfword(bytes + at);
+            if (!ib32_ticket_call_shape(bytes + at) ||
+                ((at + 4) & ~(size_t)3) + (size_t)(load & 0xff) * 4 != ref ||
+                ib32_bl_search_down(bytes + at + 8, 4) != bytes + at + 8)
+                continue;
+            if (ldr_intruction) {
+                printf("%s: Ambiguous ticket verifier references!\n", __FUNCTION__);
+                return 0;
+            }
+            iboot_str_xref = (char *)bytes + ref;
+            ldr_intruction = (char *)bytes + at;
         }
     }
-
-    printf("%s: Found iboot_str_3_xref at %p\n", __FUNCTION__, (void*) IB32_FILE_OFFSET(iboot_in, iboot_str_3_xref));
-
-    char *ldr_intruction = ib32_ldr_pcrel_search_up(iboot_str_3_xref, 0x100);
     if (!ldr_intruction) {
-        printf("%s: Unable to find ldr_intruction!\n", __FUNCTION__);
+        printf("%s: Unable to find ticket verifier reference!\n", __FUNCTION__);
         return 0;
     }
 
+    printf("%s: Found ticket verifier reference at %p\n", __FUNCTION__, (void*) IB32_FILE_OFFSET(iboot_in, iboot_str_xref));
     printf("%s: Found ldr_intruction at %p\n", __FUNCTION__, (void*) IB32_FILE_OFFSET(iboot_in, ldr_intruction));
 
-    char *last_good_bl = ib32_bl_search_down(ldr_intruction,0x100);
-    if (!last_good_bl) {
-        printf("%s: Unable to find last_good_bl!\n", __FUNCTION__);
+    char *last_good_bl = ldr_intruction + 8;
+    if (!ib32_image_contains(iboot_in, last_good_bl, 0x106)) {
+        printf("%s: Ticket verifier call lies too close to image end!\n", __FUNCTION__);
         return 0;
     }
     printf("%s: Found last_good_bl at %p...\n", __FUNCTION__, (void*) IB32_FILE_OFFSET(iboot_in, last_good_bl));
@@ -978,16 +1010,25 @@ int ib32_patch_ticket_check(struct iboot_img* iboot_in) {
     printf("%s: Found next_pop at %p...\n", __FUNCTION__, (void*) IB32_FILE_OFFSET(iboot_in, next_pop));
     printf("%s: Found next_pop at %p...\n", __FUNCTION__, (void*) IB32_ADDRESS(iboot_in, next_pop));
 
+    if (next_pop < (char *)iboot_in->buf + 0x20) {
+        printf("%s: Ticket verifier return lies too close to image start!\n", __FUNCTION__);
+        return 0;
+    }
     char *last_branch = ib32_branch_search(next_pop,0x20,1);
     char *prev_mov_r0_fail = ib32_pattern_search(next_pop, 0x20, bswap32(0x4ff0ff30), bswap32(0x4ff0ff30), -2);
 
-    if (prev_mov_r0_fail && prev_mov_r0_fail > last_branch) {
+    if (prev_mov_r0_fail && (!last_branch || prev_mov_r0_fail > last_branch)) {
         printf("%s: Detected prev_mov_r0_fail at %p...\n", __FUNCTION__, (void*) IB32_FILE_OFFSET(iboot_in, prev_mov_r0_fail));
         last_branch = prev_mov_r0_fail-2; //last branch is a BL
     }
 
     if (!last_branch) {
         printf("%s: Unable to find last_branch!\n", __FUNCTION__);
+        return 0;
+    }
+    if (last_branch + 2 < last_good_bl + 8 || last_branch >= next_pop ||
+        !ib32_image_contains(iboot_in, last_branch + 2, 4)) {
+        printf("%s: Invalid ticket verifier patch span!\n", __FUNCTION__);
         return 0;
     }
     printf("%s: Found last_branch at %p...\n", __FUNCTION__, (void*) IB32_FILE_OFFSET(iboot_in, last_branch));

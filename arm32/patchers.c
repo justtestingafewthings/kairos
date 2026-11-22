@@ -766,6 +766,29 @@ int ib32_patch_rsa_check(struct iboot_img* iboot_in) {
 
     int os_vers = ib32_get_os_version(iboot_in);
     if (os_vers == 2) return ib32_patch_ios2_rsa(iboot_in);
+    /* S5L8900 WTF (1.0-4.2.1): patch the SecureROM verifier and version marker.
+     * The IMG1 certificate overflow (0x8be/0xb08 + 0x54-byte extension) is
+     * applied separately in the Python pwnage 2.0 layer. Kairos handles only
+     * the in-code verifier patch (SBCS → MOVS) and version-marker stub. */
+    if (iboot_in->len >= 0x340 &&
+        !memcmp((uint8_t *)iboot_in->buf + 0x200, "SecureROM for s5l8900xwtf",
+                sizeof("SecureROM for s5l8900xwtf") - 1)) {
+        uint8_t *bytes = iboot_in->buf;
+        uint8_t *end = memchr(bytes + 0x280, 0, 0x40);
+        uint8_t *rsa = ib32_find_rsa_check_3_4(iboot_in);
+        if (!end || end < bytes + 0x280 + 3 || end[-3] != '.' ||
+            end[-2] < '0' || end[-2] > '9' || end[-1] < '0' || end[-1] > '9' ||
+            !rsa || rsa < bytes || (size_t)(rsa - bytes) > iboot_in->len - 4 ||
+            memcmp(rsa, "\x01\x20\x40\x42", 4)) {
+            fputs("Could not validate S5L8900 WTF verifier and version marker\n", stderr);
+            return 0;
+        }
+        rsa[2] = 0; rsa[3] = 0x20;
+        end[-1] = 'x';
+        printf("%s: Patched S5L8900 WTF verifier at %#zx and version marker at %#zx\n",
+               __FUNCTION__, (size_t)(rsa - bytes) + 2, (size_t)(end - bytes) - 1);
+        return 1;
+    }
     if(os_vers == 4 || os_vers == 3) {
         void* rsa_check_3_4 = ib32_find_rsa_check_3_4(iboot_in);
         if(!rsa_check_3_4) {

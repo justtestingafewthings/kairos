@@ -1243,6 +1243,22 @@ static int ios1_checks(const struct iboot_img *i,size_t *header,size_t *data) {
             b=p+2;callee=dest;
         }
     }
+    /* Fallback for iBoot-159: the size encoding and surrounding instructions
+     * differ from iBoot-204. Search for any BL to the memcmp byte-comparator
+     * that is immediately followed by CMP R0,#0 and a conditional branch. */
+    if(a==SIZE_MAX || b==SIZE_MAX) {
+        a=b=SIZE_MAX;
+        for(size_t p=0x348;p+8<=i->len;p+=2) {
+            size_t dest=ios1_bl(i,p);
+            if(dest==SIZE_MAX || !ios1_memcmp(i,dest)) continue;
+            if(ios1_h(i,p+4)!=0x2800) continue;        /* CMP R0,#0 */
+            uint16_t branch=ios1_h(i,p+6);
+            if((branch&0xf000)!=0xd000) continue;       /* BCc */
+            if(a==SIZE_MAX) a=p;
+            else if(b==SIZE_MAX) b=p;
+            else return 0;
+        }
+    }
     if(a==SIZE_MAX || b==SIZE_MAX || b<=a || b-a>0x1000) return 0;
     *header=a;*data=b;return 1;
 }

@@ -1536,3 +1536,5 @@ int unlock_nvram(struct iboot64_img* iboot_in) {
 	write_opcode(iboot_in->buf,appleSystemFuncBegin+4,retInsn);
 	return 0;
 }
+
+#include "storage_keys64.c"

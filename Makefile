@@ -21,7 +21,7 @@ HEADERS := $(wildcard include/*.h arm32/include/*.h)
 .PHONY: all clean
 all: $(TARGET)
 
-$(TARGET): $(SOURCES) $(HEADERS) Makefile
+$(TARGET): $(SOURCES) $(HEADERS) storage_keys64.c Makefile
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(LDFLAGS) -o $@ $(SOURCES) $(LDLIBS)
 
 clean:

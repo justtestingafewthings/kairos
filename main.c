@@ -40,6 +40,7 @@ int main(int argc, char* argv[]) {
 		printf("\t-d, --debug\t\tenable kernel debug (kernel-loading images)\n");
 		printf("\t--early-uart\t\t\tenable early DFU UART (iBSS/iLLB, iOS 5+)\n");
 		printf("\t--disable-kaslr\t\tdisable kernel address randomization (iOS 6+)\n");
+		printf("\t--storage-keys\t\tlegacy ARM64 UID/AES storage access\n");
 		printf("ARM32 options: --ticket -a --local-boot --remote-boot\n");
 		printf("\t--boot-partition --boot-ramdisk --setenv\n");
 		printf("\t--logo --logo4 --433 --dualboot\n");
@@ -66,6 +67,7 @@ int main(int argc, char* argv[]) {
 	bool doKaslr = false;
 	bool doDebug = false;
 	bool doRsa = false;
+	bool doStorageKeys = false;
 
 	for(int i = 3; i < argc; i++) {
 		if(!strcmp(argv[i], "-b") && i + 1 < argc) {
@@ -88,6 +90,8 @@ int main(int argc, char* argv[]) {
 			doUart = true;
 		} else if(!strcmp(argv[i], "--disable-kaslr")) {
 			doKaslr = true;
+		} else if(!strcmp(argv[i], "--storage-keys")) {
+			doStorageKeys = true;
 		} else if(!strcmp(argv[i], "-n")) {
 			doNvramUnlock = true;
 		} else if(!strcmp(argv[i], "-f") || !strcmp(argv[i], "--fresh-nonce")) {
@@ -104,7 +108,7 @@ int main(int argc, char* argv[]) {
 		WARN("Command name cannot be empty\n");
 		return 1;
 	}
-	if(freshNonceOnly && (doNvramUnlock || bootArgs || command_str || doUart || doKaslr || doDebug || doRsa)) {
+	if(freshNonceOnly && (doNvramUnlock || bootArgs || command_str || doUart || doKaslr || doDebug || doRsa || doStorageKeys)) {
 		WARN("--fresh-nonce-only cannot be combined with other patch options\n");
 		return 1;
 	}
@@ -148,6 +152,7 @@ int main(int argc, char* argv[]) {
 	memcpy(&reset, iboot_in.buf, sizeof(reset));
 	uint32_t base;
 	if(watch_image_info(iboot_in.buf, iboot_in.len, &base)) {
+		if(doStorageKeys) { WARN("Legacy ARM64 storage keys are not applicable to Thumb Watch images\n");goto patch_failed; }
 		iboot_in.base = base;
 		get_iboot64_version(&iboot_in);
 		LOG("ARMv7 Thumb Watch bootloader, base 0x%08x, iBoot-%u.%u\n", base, iboot_in.VERS,
@@ -234,6 +239,9 @@ int main(int argc, char* argv[]) {
 	}
 	if(freshNonceOnly)
 		goto write_output;
+	if(doStorageKeys && storage_keys_patch64(&iboot_in) < 0) {
+		WARN("Failed to locate legacy ARM64 storage-key patches\n");goto patch_failed;
+	}
 	bool pac = doRsa && iboot64_pac_check(&iboot_in);
 	if(has_kernel_load_k(&iboot_in)) {
 		LOG("Does have kernel load\n");

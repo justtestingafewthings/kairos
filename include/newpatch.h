@@ -59,3 +59,5 @@ int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintpt
 int unlock_nvram(struct iboot64_img* iboot_in);
 int freshnonce_patch(struct iboot64_img* iboot_in);
 bool iboot64_pac_check(struct iboot64_img* iboot_in);
+
+int storage_keys_patch64(struct iboot64_img *image);

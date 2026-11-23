@@ -736,10 +736,27 @@ static int a64_bootargs(struct iboot64_img* image, const char* args) {
 			run++;
 			continue;
 		}
-		if(!(p & 0x7ff) && run >= 512 && run >= reserve + 32) { // 2 KiB alignment
-			storage = p - reserve - 16;
-			break;
+		if(!(p & 0x7ff) && run >= reserve + 32) { // 2 KiB alignment
+			/* Newer mBoot leaves less than 512 bytes before the next code
+			 * region. Accept that gap only after a terminal instruction and
+			 * before a BTI entry, never an arbitrary zero-filled data table. */
+			size_t start = p - run;
+			if(run < 512) {
+				if(start < 0x344 || (start & 3) || image->len - p < 4)
+					goto next_run;
+				uint32_t end = a64_word(image, start - 4);
+				if(((end & 0xfc000000) != 0x14000000 && end != 0xd65f03c0) ||
+					a64_word(image, p) != 0xd50328bf) // BTI C
+					goto next_run;
+			}
+			size_t candidate = p - reserve - 16;
+			int64_t distance = (int64_t)candidate - (int64_t)selected;
+			if(distance >= -(1LL << 20) && distance < (1LL << 20)) {
+				storage = candidate;
+				break;
+			}
 		}
+	next_run:
 		run = 0;
 	}
 	if(!storage || (int64_t)storage - (int64_t)selected < -(1LL << 20) ||

@@ -900,7 +900,8 @@ uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in) {  // modified f
 	if(iboot_in->buf) {
 		/* mBoot stores its linked base in a startup relocation literal. */
 		if(iboot_in->len >= 0x340 &&
-			!memcmp((uint8_t *)iboot_in->buf + 0x300, "mBoot-", 6)) {
+			(!memcmp((uint8_t *)iboot_in->buf + 0x280, "mBoot-", 6) ||
+			 !memcmp((uint8_t *)iboot_in->buf + 0x300, "mBoot-", 6))) {
 			uint32_t load = a64_word(iboot_in, 8);
 			int64_t literal = 8 + a64_signed((load >> 5) & 0x7ffff, 19) * 4;
 			if(a64_word(iboot_in, 0) != 0x90000000 ||
@@ -908,7 +909,8 @@ uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in) {  // modified f
 				(load & 0xff00001f) != 0x58000001 ||
 				(a64_word(iboot_in, 12) & 0xfc000000) != 0x94000000 ||
 				a64_word(iboot_in, 16) != 0xeb00003f ||
-				literal < 0x340 || (uint64_t)literal > iboot_in->len - 8)
+				literal < (!memcmp((uint8_t *)iboot_in->buf + 0x280, "mBoot-", 6) ? 0x300 : 0x340) ||
+				(uint64_t)literal > iboot_in->len - 8)
 				return 0;
 			uint64_t base = a64_pointer(iboot_in, (size_t)literal);
 			if(base < UINT64_C(0x100000000) || base >= (UINT64_C(1) << 48) || (base & 0xfff))
@@ -927,9 +929,17 @@ uint64_t get_iboot64_base_address(struct iboot64_img* iboot_in) {  // modified f
 
 uint32_t get_iboot64_version(struct iboot64_img* iboot_in) {
 	const char* version = memmem(iboot_in->buf, iboot_in->len, "iBoot-", 6);
-	if(!version && iboot_in->len >= 0x306 &&
-		!memcmp((uint8_t *)iboot_in->buf + 0x300, "mBoot-", 6))
-		version = (const char *)iboot_in->buf + 0x300;
+	if(!version) {
+		const size_t offsets[] = {0x280, 0x300};
+		for(size_t i = 0; i < sizeof(offsets) / sizeof(offsets[0]); i++) {
+			size_t p = offsets[i];
+			if(iboot_in->len >= p + 6 &&
+				!memcmp((uint8_t *)iboot_in->buf + p, "mBoot-", 6)) {
+				version = (const char *)iboot_in->buf + p;
+				break;
+			}
+		}
+	}
 	iboot_in->VERS = 0;
 	iboot_in->minor_vers = 0;
 	if(!version)

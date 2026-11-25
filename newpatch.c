@@ -1525,6 +1525,18 @@ int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintpt
 	return 0;
 }
 
+static void a64_nvram_return_zero(struct iboot64_img* image, addr_t function) {
+	uint32_t return_insn = new_ret_insn(-1);
+	/* bof64 can skip the PAC instruction immediately before the stack prologue. */
+	if(function >= 4) {
+		uint32_t prior = a64_word(image, function - 4);
+		if(prior == 0xd503237f) return_insn = 0xd65f0fff; // PACIBSP -> RETAB
+		if(prior == 0xd503233f) return_insn = 0xd65f0bff; // PACIASP -> RETAA
+	}
+	write_opcode(image->buf, function, new_mov_immediate_insn(0, 0, 1));
+	write_opcode(image->buf, function + 4, return_insn);
+}
+
 int unlock_nvram(struct iboot64_img* iboot_in) {
 	if(iboot_in->VERS >= 7429) {
 		if(a64_nvram(iboot_in) == 0) return 0;
@@ -1618,21 +1630,16 @@ int unlock_nvram(struct iboot64_img* iboot_in) {
 		WARN("Unable to find beginning of function where \"com.apple.System.\" is referenced\n");
 		return -1;
 	}
-	uint32_t movZeroZero = new_mov_immediate_insn(0,0,1);
-	uint32_t retInsn = new_ret_insn(-1);
 	LOG("Forcing sub_%llx to return immediately\n",blacklistFuncBegin+iboot_in->base);
-	write_opcode(iboot_in->buf,blacklistFuncBegin,movZeroZero);
-	write_opcode(iboot_in->buf,blacklistFuncBegin+4,retInsn);
+	a64_nvram_return_zero(iboot_in, blacklistFuncBegin);
 	if(blacklistFunc2Begin) {
 		LOG("Forcing sub_%llx to return immediately\n",blacklistFunc2Begin+iboot_in->base);
-		write_opcode(iboot_in->buf,blacklistFunc2Begin,movZeroZero);
-		write_opcode(iboot_in->buf,blacklistFunc2Begin+4,retInsn);
+		a64_nvram_return_zero(iboot_in, blacklistFunc2Begin);
 	} else {
 		LOG("Using the shared legacy ARM64 NVRAM whitelist\n");
 	}
 	LOG("Forcing sub_%llx to return immediately\n",appleSystemFuncBegin+iboot_in->base);
-	write_opcode(iboot_in->buf,appleSystemFuncBegin,movZeroZero);
-	write_opcode(iboot_in->buf,appleSystemFuncBegin+4,retInsn);
+	a64_nvram_return_zero(iboot_in, appleSystemFuncBegin);
 	return 0;
 }
 

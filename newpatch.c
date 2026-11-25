@@ -1346,6 +1346,9 @@ static int do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, 
 		LOG("Patched authenticated ARM64 IMG4 verifier return at 0x%llx\n",verifyFunc);
 		return 0;
 	}
+	/* An unsigned verifier can use the plain RET gadget only from its entry.
+	 * Reject interior targets, where an earlier PAC may already have run. */
+	if(pac && !a64_prologue(a64_word(iboot_in, verifyFunc))) return -1;
 	addr_t crawl = verifyFunc;
 	if (iboot_in->VERS < 5540) { // iOS 10-12
 		crawl += 4;

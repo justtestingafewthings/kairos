@@ -117,8 +117,9 @@ static size_t a64_function(const struct iboot64_img* image, size_t ref) {
 		for(size_t q = p; q >= 0x344 && p - q < 128; q -= 4)
 			if(a64_prologue(a64_word(image, q - 4))) {
 				size_t start = q - 4;
-				if(start >= 4 && a64_word(image, start - 4) == 0xd503237f)
-					start -= 4; // Include PACIBSP.
+				if(start >= 4 && (a64_word(image, start - 4) == 0xd503237f ||
+					a64_word(image, start - 4) == 0xd503233f))
+					start -= 4; // Include PACIBSP or PACIASP.
 				return start;
 			}
 		return 0;
@@ -825,6 +826,27 @@ static int a64_nvram_name(const struct iboot64_img* image, size_t p) {
 	return 0;
 }
 
+static int a64_nvram_return_zero(struct iboot64_img* image, size_t function) {
+	if(function > image->len || image->len - function < 8)
+		return -1;
+	uint32_t return_insn = new_ret_insn(-1);
+	uint32_t current = a64_word(image, function);
+	if(current == 0xd503237f || current == 0xd503233f) {
+		/* Keep the PAC instruction at the function entry. */
+		function += 4;
+		if(image->len - function < 8) return -1;
+		return_insn = current == 0xd503237f ? 0xd65f0fff : 0xd65f0bff;
+	} else if(function >= 4) {
+		/* bof64 can skip the PAC instruction immediately before the stack prologue. */
+		uint32_t prior = a64_word(image, function - 4);
+		if(prior == 0xd503237f) return_insn = 0xd65f0fff;
+		if(prior == 0xd503233f) return_insn = 0xd65f0bff;
+	}
+	write_opcode(image->buf, function, new_mov_immediate_insn(0, 0, 1));
+	write_opcode(image->buf, function + 4, return_insn);
+	return 0;
+}
+
 static int a64_nvram(struct iboot64_img* image) {
 	const uint8_t* b = image->buf;
 	const char name[] = "debug-uarts";
@@ -870,8 +892,7 @@ static int a64_nvram(struct iboot64_img* image) {
 	if(functions[0] == functions[1] || functions[0] == functions[2] || functions[1] == functions[2])
 		return -1;
 	for(size_t i = 0; i < 3; i++) {
-		write_opcode(image->buf, functions[i], 0xd2800000);
-		write_opcode(image->buf, functions[i] + 4, 0xd65f03c0);
+		if(a64_nvram_return_zero(image, functions[i]) < 0) return -1;
 		LOG("Patched ARM64 NVRAM restriction at 0x%zx\n", functions[i]);
 	}
 	return 0;
@@ -1525,18 +1546,6 @@ int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintpt
 	return 0;
 }
 
-static void a64_nvram_return_zero(struct iboot64_img* image, addr_t function) {
-	uint32_t return_insn = new_ret_insn(-1);
-	/* bof64 can skip the PAC instruction immediately before the stack prologue. */
-	if(function >= 4) {
-		uint32_t prior = a64_word(image, function - 4);
-		if(prior == 0xd503237f) return_insn = 0xd65f0fff; // PACIBSP -> RETAB
-		if(prior == 0xd503233f) return_insn = 0xd65f0bff; // PACIASP -> RETAA
-	}
-	write_opcode(image->buf, function, new_mov_immediate_insn(0, 0, 1));
-	write_opcode(image->buf, function + 4, return_insn);
-}
-
 int unlock_nvram(struct iboot64_img* iboot_in) {
 	if(iboot_in->VERS >= 7429) {
 		if(a64_nvram(iboot_in) == 0) return 0;
@@ -1631,15 +1640,15 @@ int unlock_nvram(struct iboot64_img* iboot_in) {
 		return -1;
 	}
 	LOG("Forcing sub_%llx to return immediately\n",blacklistFuncBegin+iboot_in->base);
-	a64_nvram_return_zero(iboot_in, blacklistFuncBegin);
+	if(a64_nvram_return_zero(iboot_in, blacklistFuncBegin) < 0) return -1;
 	if(blacklistFunc2Begin) {
 		LOG("Forcing sub_%llx to return immediately\n",blacklistFunc2Begin+iboot_in->base);
-		a64_nvram_return_zero(iboot_in, blacklistFunc2Begin);
+		if(a64_nvram_return_zero(iboot_in, blacklistFunc2Begin) < 0) return -1;
 	} else {
 		LOG("Using the shared legacy ARM64 NVRAM whitelist\n");
 	}
 	LOG("Forcing sub_%llx to return immediately\n",appleSystemFuncBegin+iboot_in->base);
-	a64_nvram_return_zero(iboot_in, appleSystemFuncBegin);
+	if(a64_nvram_return_zero(iboot_in, appleSystemFuncBegin) < 0) return -1;
 	return 0;
 }
 

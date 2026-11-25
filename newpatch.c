@@ -380,7 +380,7 @@ static int a64_nonce_keep_generator(const struct iboot64_img* image, size_t read
 			(op & 0xffc003ff) != 0xd10003bf && // SUB SP,X29,#imm
 			(op & 0xffc003e0) != 0xa94003e0 && // LDP ..., [SP,#imm]
 			(op & 0xffc003e0) != 0xa8c003e0 && // LDP ..., [SP],#imm
-			op != 0xd50323ff) // AUTIBSP
+			op != 0xd50323ff && op != 0xd50323bf) // AUTIBSP/AUTIASP
 			return -1;
 	}
 	*removal = refs[1];
@@ -494,7 +494,8 @@ static size_t a64_sigcheck_result(const struct iboot64_img* image,
 	size_t start, size_t end) {
 	size_t selected = 0;
 	for(size_t p = start; p + 4 <= end; p += 4) {
-		if(a64_word(image, p) != 0xd65f03c0 && a64_word(image, p) != 0xd65f0fff)
+		if(a64_word(image, p) != 0xd65f03c0 && a64_word(image, p) != 0xd65f0fff &&
+			a64_word(image, p) != 0xd65f0bff)
 			continue;
 		int frame = 0, stack = 0, result = 0;
 		for(size_t q = p; q >= start + 4 && p - q < 64;) {
@@ -604,7 +605,9 @@ static int a64_sigcheck(struct iboot64_img* image) {
 			continue;
 		size_t callback = (size_t)(pointer - image->base);
 		if(image->len - callback < 8 ||
-			(!a64_prologue(a64_word(image, callback)) && a64_word(image, callback) != 0xd503237f))
+			(!a64_prologue(a64_word(image, callback)) &&
+			a64_word(image, callback) != 0xd503237f &&
+			a64_word(image, callback) != 0xd503233f))
 			continue;
 		size_t end = (size_t)(next - image->base);
 		if(end <= callback || end - callback > 0x2000)
@@ -826,7 +829,7 @@ static int a64_nvram_name(const struct iboot64_img* image, size_t p) {
 	return 0;
 }
 
-static int a64_nvram_return_zero(struct iboot64_img* image, size_t function) {
+static int a64_return_zero(struct iboot64_img* image, size_t function) {
 	if(function > image->len || image->len - function < 8)
 		return -1;
 	uint32_t return_insn = new_ret_insn(-1);
@@ -892,7 +895,7 @@ static int a64_nvram(struct iboot64_img* image) {
 	if(functions[0] == functions[1] || functions[0] == functions[2] || functions[1] == functions[2])
 		return -1;
 	for(size_t i = 0; i < 3; i++) {
-		if(a64_nvram_return_zero(image, functions[i]) < 0) return -1;
+		if(a64_return_zero(image, functions[i]) < 0) return -1;
 		LOG("Patched ARM64 NVRAM restriction at 0x%zx\n", functions[i]);
 	}
 	return 0;
@@ -1021,8 +1024,9 @@ void* iboot64_memmem(struct iboot64_img* iboot_in, void* pat) { // slightly modi
 }
 
 bool iboot64_pac_check(struct iboot64_img* iboot_in) {
-	void *pacibsp = memmem(iboot_in->buf,iboot_in->len,PACIBSP,0x4);
-	if (!pacibsp) {
+	const uint32_t paciasp = 0xd503233f;
+	if (!memmem(iboot_in->buf,iboot_in->len,PACIBSP,0x4) &&
+		!memmem(iboot_in->buf,iboot_in->len,&paciasp,sizeof(paciasp))) {
 		return false;
 	}
 	WARN("PAC bootloader detected\n");
@@ -1229,10 +1233,10 @@ static int do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, 
 	if(iboot_in->len < 8 || img4Xref > iboot_in->len - 4 || (img4Xref & 3))
 		return -1;
 	addr_t img4refFtop = bof64(iboot_in->buf, 0, img4Xref);
-	if (pac == true) {
-		if(img4refFtop < 4)
-			return -1;
-		img4refFtop = img4refFtop - 0x4;
+	if (pac && img4refFtop >= 4 &&
+		(a64_word(iboot_in, img4refFtop - 4) == 0xd503237f ||
+		 a64_word(iboot_in, img4refFtop - 4) == 0xd503233f)) {
+		img4refFtop -= 4;
 	}
 	if(!img4refFtop || img4refFtop >= iboot_in->len)
 		return -1;
@@ -1327,6 +1331,21 @@ static int do_rsa_sigcheck_patch(struct iboot64_img* iboot_in, addr_t img4Xref, 
 	if((verifyFunc & 3) || verifyFunc > iboot_in->len - 4)
 		return -1;
 	LOG("Call to sub_%llx\n",verifyFunc+iboot_in->base);
+	/* A signed return address needs RETAB/RETAA. A plain RET gadget would
+	 * branch out of the function without authenticating it. */
+	if(pac && (a64_word(iboot_in, verifyFunc) == 0xd503237f ||
+		a64_word(iboot_in, verifyFunc) == 0xd503233f ||
+		(verifyFunc >= 4 && (a64_word(iboot_in, verifyFunc - 4) == 0xd503237f ||
+			a64_word(iboot_in, verifyFunc - 4) == 0xd503233f)))) {
+		size_t prologue = verifyFunc +
+			(a64_word(iboot_in, verifyFunc) == 0xd503237f ||
+			 a64_word(iboot_in, verifyFunc) == 0xd503233f ? 4 : 0);
+		if(prologue > iboot_in->len || iboot_in->len - prologue < 8 ||
+			!a64_prologue(a64_word(iboot_in, prologue))) return -1;
+		if(a64_return_zero(iboot_in, verifyFunc) < 0) return -1;
+		LOG("Patched authenticated ARM64 IMG4 verifier return at 0x%llx\n",verifyFunc);
+		return 0;
+	}
 	addr_t crawl = verifyFunc;
 	if (iboot_in->VERS < 5540) { // iOS 10-12
 		crawl += 4;
@@ -1640,15 +1659,15 @@ int unlock_nvram(struct iboot64_img* iboot_in) {
 		return -1;
 	}
 	LOG("Forcing sub_%llx to return immediately\n",blacklistFuncBegin+iboot_in->base);
-	if(a64_nvram_return_zero(iboot_in, blacklistFuncBegin) < 0) return -1;
+	if(a64_return_zero(iboot_in, blacklistFuncBegin) < 0) return -1;
 	if(blacklistFunc2Begin) {
 		LOG("Forcing sub_%llx to return immediately\n",blacklistFunc2Begin+iboot_in->base);
-		if(a64_nvram_return_zero(iboot_in, blacklistFunc2Begin) < 0) return -1;
+		if(a64_return_zero(iboot_in, blacklistFunc2Begin) < 0) return -1;
 	} else {
 		LOG("Using the shared legacy ARM64 NVRAM whitelist\n");
 	}
 	LOG("Forcing sub_%llx to return immediately\n",appleSystemFuncBegin+iboot_in->base);
-	if(a64_nvram_return_zero(iboot_in, appleSystemFuncBegin) < 0) return -1;
+	if(a64_return_zero(iboot_in, appleSystemFuncBegin) < 0) return -1;
 	return 0;
 }
 

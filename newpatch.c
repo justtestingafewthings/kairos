@@ -877,6 +877,103 @@ static int a64_nvram(struct iboot64_img* image) {
 	return 0;
 }
 
+/* Newer iBoot/mBoot stores the console allowlists as pairs of string objects.
+ * Change only the deny results, leaving the PAC prologues and epilogues intact. */
+static int a64_nvram_string(const struct iboot64_img* image, size_t slot, const char* name) {
+	if(slot > image->len || image->len - slot < 8)
+		return 0;
+	uint64_t pointer = a64_pointer(image, slot);
+	size_t length = strlen(name) + 1;
+	return pointer >= image->base && pointer - image->base <= image->len &&
+		image->len - (pointer - image->base) >= length &&
+		!memcmp((const uint8_t*)image->buf + pointer - image->base, name, length);
+}
+
+static int a64_nvram_schema(struct iboot64_img* image) {
+	const uint8_t* b = image->buf;
+	size_t short_table = 0, long_table = 0, short_ref = 0, long_ref = 0;
+	for(size_t p = 0x340; p + 0x40 <= image->len; p += 8) {
+		if(a64_nvram_string(image, p, "debug-uarts") &&
+			a64_nvram_string(image, p + 0x10, "debug-uarts") &&
+			a64_nvram_string(image, p + 0x18, "debug-uarts") &&
+			a64_nvram_string(image, p - 0x20, "boot-args") &&
+			a64_nvram_string(image, p - 0x10, "boot-args") &&
+			a64_nvram_string(image, p - 0x08, "boot-args") &&
+			a64_nvram_string(image, p - 0x30, "auto-boot") &&
+			a64_nvram_string(image, p - 0x28, "auto-boot") &&
+			a64_nvram_string(image, p + 0x20, "pwr-path")) {
+			size_t anchor = p - 0x20, ref = a64_xref(image, anchor);
+			if(!ref) { anchor -= 0x10; ref = a64_xref(image, anchor); }
+			if(!ref || short_table) return -1;
+			short_table = anchor; short_ref = ref;
+		}
+		if(p >= 11 * 0x20 && a64_nvram_string(image, p, "debug-uarts") &&
+			a64_nvram_string(image, p + 0x10, "debug-uarts") &&
+			a64_nvram_string(image, p + 0x18, "debug-uarts") &&
+			a64_pointer(image, p + 8) != a64_pointer(image, p) &&
+			a64_pointer(image, p + 8) == a64_pointer(image, p - 0x18) &&
+			a64_nvram_string(image, p - 0x20, "stress-rack") &&
+			a64_nvram_string(image, p - 4 * 0x20, "com.apple.System.boot-nonce") &&
+			a64_nvram_string(image, p - 4 * 0x20 + 0x10, "com.apple.System.boot-nonce") &&
+			a64_nvram_string(image, p - 4 * 0x20 + 0x18, "com.apple.System.boot-nonce") &&
+			a64_nvram_string(image, p + 0x20, "device-material")) {
+			size_t anchor = p - 11 * 0x20, ref = a64_xref(image, anchor);
+			if(!ref) { anchor -= 0x10; ref = a64_xref(image, anchor); }
+			if(!ref || long_table) return -1;
+			long_table = anchor; long_ref = ref;
+		}
+	}
+	if(!short_table || !long_table || short_table == long_table ||
+		!a64_function(image, short_ref) || !a64_function(image, long_ref)) {
+		WARN("Invalid ARM64 NVRAM schema tables (short 0x%zx ref 0x%zx, long 0x%zx ref 0x%zx)\n",
+			short_table, short_ref, long_table, long_ref);
+		return -1;
+	}
+	size_t short_deny = 0, long_deny = 0, namespace_deny = 0;
+	for(size_t p = short_ref + 8; p + 8 <= image->len && p < short_ref + 32; p += 4)
+		if(a64_word(image, p) == 0x1a9f17f7 &&
+			a64_word(image, p - 4) == 0xf1000718 &&
+			(a64_word(image, p + 4) & 0x7e00001f) == 0x34000018) {
+			if(short_deny) return -1;
+			short_deny = p;
+		}
+	for(size_t p = long_ref + 24; p + 8 <= image->len && p < long_ref + 160; p += 4) {
+		uint32_t op = a64_word(image, p), prior = a64_word(image, p - 4);
+		if(((op == 0x52800020 && prior == 0x34000040) ||
+			(op == 0x1a9f17e0 && prior == 0xf10002ff)) &&
+			(a64_word(image, p + 4) & 0xffc07fff) == 0xa9407bfd) {
+			if(long_deny) return -1;
+			long_deny = p;
+		}
+	}
+	const char system[] = "com.apple.System.";
+	for(size_t p = 0x340; p + sizeof(system) <= image->len; p++) {
+		if(memcmp(b + p, system, sizeof(system))) continue;
+		size_t ref = a64_xref(image, p);
+		if(!ref || !a64_function(image, ref)) return -1;
+		for(size_t q = ref + 12; q + 8 <= image->len && q < ref + 44; q += 4)
+			if(a64_word(image, q - 4) == 0x7100001f &&
+				a64_word(image, q) == 0x1a9f17e0 &&
+				(a64_word(image, q + 4) & 0xffc07fff) == 0xa9407bfd) {
+				if(namespace_deny) return -1;
+				namespace_deny = q;
+			}
+	}
+	if(!short_deny || !long_deny || !namespace_deny ||
+		short_deny == long_deny || short_deny == namespace_deny || long_deny == namespace_deny) {
+		WARN("Invalid ARM64 NVRAM schema checks (short 0x%zx, long 0x%zx, namespace 0x%zx)\n",
+			short_deny, long_deny, namespace_deny);
+		return -1;
+	}
+	write_opcode(image->buf, short_deny, 0x52800017); // MOV W23,#0
+	write_opcode(image->buf, long_deny, 0x52800000); // MOV W0,#0
+	write_opcode(image->buf, namespace_deny, 0x52800000);
+	LOG("Patched ARM64 NVRAM restriction at 0x%zx\n", short_deny);
+	LOG("Patched ARM64 NVRAM restriction at 0x%zx\n", long_deny);
+	LOG("Patched ARM64 NVRAM restriction at 0x%zx\n", namespace_deny);
+	return 0;
+}
+
 /* begin functions from iBoot32Patcher by iH8sn0w*/
 bool has_magic(uint8_t* buf) {
 	uint32_t magic;
@@ -1429,8 +1526,10 @@ int do_command_handler_patch(struct iboot64_img* iboot_in, char* command, uintpt
 }
 
 int unlock_nvram(struct iboot64_img* iboot_in) {
-	if(iboot_in->VERS >= 7429)
-		return a64_nvram(iboot_in);
+	if(iboot_in->VERS >= 7429) {
+		if(a64_nvram(iboot_in) == 0) return 0;
+		return a64_nvram_schema(iboot_in);
+	}
 	void* debuguartLoc = memmem(iboot_in->buf,iboot_in->len,"debug-uarts",strlen("debug-uarts"));
 	if(!debuguartLoc) {
 		WARN("Unable to find debug-uarts string\n");

@@ -12,6 +12,7 @@
 #include "include/patchers.h"
 #include "dfuuart.h"
 #include "watchkaslr.h"
+#include "watchoptions.h"
 
 int kairos_arm32_main(int argc, char **argv) {
     char *boot_args = NULL, *command = NULL;
@@ -19,7 +20,7 @@ int kairos_arm32_main(int argc, char **argv) {
     bool env = false, debug = false, partition = false;
     bool ramdisk = false, setenv = false, ticket = false, remote = false, local = false;
     bool kaslr = false, jump = false, logo = false, logo4 = false, dualboot = false, uart = false;
-    bool rsa = false;
+    bool rsa = false, nvram = false;
     for (int i = 3; i < argc; ++i) {
         const char *option = argv[i];
         if (!strcmp(option, "-b") && i + 1 < argc) boot_args = argv[++i];
@@ -37,6 +38,7 @@ int kairos_arm32_main(int argc, char **argv) {
         else if (!strcmp(option, "--boot-partition")) partition = true;
         else if (!strcmp(option, "--boot-ramdisk")) ramdisk = true;
         else if (!strcmp(option, "--setenv")) setenv = true;
+        else if (!strcmp(option, "-n")) nvram = true;
         else if (!strcmp(option, "--ticket")) ticket = true;
         else if (!strcmp(option, "--local-boot")) local = true;
         else if (!strcmp(option, "--remote-boot")) remote = true;
@@ -151,6 +153,15 @@ int kairos_arm32_main(int argc, char **argv) {
     if (rsa) APPLY(ios1 ? ib32_patch_ios1_img2(&image) : ib32_patch_rsa_check(&image));
     if (partition) APPLY(ib32_patch_boot_partition(&image, os == 9));
     if (ramdisk) APPLY(ib32_patch_boot_ramdisk(&image));
+    if (nvram) {
+        struct iboot64_img view = {0};
+        view.buf = image.buf;view.len = image.len;
+        view.base = ib32_get_iboot_base_address(image.buf);
+        view.VERS = image.VERS;
+        if (arm32_nvram_patch(&view) < 0 && watch_nvram_patch(&view) < 0) {
+            fputs("Cannot validate ARM32 NVRAM permission checks\n", stderr);goto failure;
+        }
+    }
     if (setenv) APPLY(ib32_patch_setenv_cmd(&image));
     if (dualboot) APPLY(ib32_patch_dualboot(&image));
     if (uart && dfu_uart_patch(image.buf, image.len)) goto failure;

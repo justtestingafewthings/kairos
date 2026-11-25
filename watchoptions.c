@@ -86,7 +86,7 @@ static size_t function_start(const struct iboot64_img* img, size_t at) {
 				if((h & 0xff00) == 0xaf00 || (rd16(img, p) == 0xb580 && h == 0x466f))
 					return p;
 				if((h & 0xf800) != 0x4800 && (h & 0xf800) != 0x2000 &&
-					(h & 0xff00) != 0x4600)
+					(h & 0xff00) != 0x4600 && (h & 0xf800) != 0x2800)
 					break;
 			}
 		}
@@ -568,6 +568,140 @@ int watch_nvram_patch(struct iboot64_img* img) {
 		LOG("Unlocked Thumb NVRAM check at 0x%zx\n", funcs[i]);
 	}
 	return 0;
+}
+
+/* iPhone ARM32 consoles inline the namespace check in getenv/setenv. */
+static int arm32_nvram_string_pointer(const struct iboot64_img* img, size_t p) {
+    if(p + 4 > img->len) return 0;
+    uint32_t ptr = rd32(img, p);
+    if(ptr < img->base || ptr - img->base >= img->len) return 0;
+    const uint8_t* b = img->buf;
+    size_t off = ptr - img->base;
+    for(size_t n = 0; n < 128 && off + n < img->len; n++) {
+        if(!b[off + n]) return n != 0;
+        if(b[off + n] <= 32 || b[off + n] >= 127) return 0;
+    }
+    return 0;
+}
+
+int arm32_nvram_patch(struct iboot64_img* img) {
+    size_t reader = command_handler(img, "getenv");
+    if(reader == SIZE_MAX) reader = command_handler(img, "printenv");
+    size_t handlers[4] = { reader, command_handler(img, "setenv"),
+                           command_handler(img, "saveenv"), command_handler(img, "printenv") };
+    if(handlers[0] == SIZE_MAX || handlers[1] == SIZE_MAX || handlers[2] == SIZE_MAX) {
+        if(img->VERS < 900 && find_string(img, "com.apple.System.") == SIZE_MAX &&
+           find_string(img, "setenv") == SIZE_MAX && find_string(img, "saveenv") == SIZE_MAX) {
+            LOG("ARM32 loader has no NVRAM recovery commands; unlock not applicable\n");
+            return 0;
+        }
+        return -1;
+    }
+    size_t namespace_calls[8], namespace_count = 0, funcs[4], count = 0;
+    size_t system = find_string(img, "com.apple.System.");
+    for(size_t h = 0; h < 4; h++) {
+        if(h == 2 || handlers[h] == SIZE_MAX || (h == 3 && handlers[h] == reader)) continue;
+        size_t start = handlers[h], end = start + 0x300;
+        if(end > img->len) end = img->len;
+        for(size_t j = 0; j < 4; j++)
+            if(handlers[j] > start && handlers[j] < end) end = handlers[j];
+        size_t before = namespace_count;
+        for(size_t p = start; p + 4 <= end; p += width(rd16(img, p))) {
+            unsigned reg;
+            size_t slot = literal(img, p, &reg);
+            if(system == SIZE_MAX || slot == SIZE_MAX || reg != 1 || rd32(img, slot) != img->base + system) continue;
+            int length = 0;
+            size_t call = SIZE_MAX;
+            for(size_t q = p > start + 4 ? p - 4 : start; q + 4 <= end && q <= p + 16; q += width(rd16(img, q))) {
+                if(rd16(img, q) == 0x2211) length = 1;
+                if(q > p && is_bl(img, q)) { call = q; break; }
+            }
+            int compare = 0, reject = 0;
+            if(call != SIZE_MAX) for(size_t q = call + 4; q + 2 <= end && q <= call + 20; q += width(rd16(img, q))) {
+                uint16_t w = rd16(img, q);
+                if((w & 0xf8ff) == 0x2800) compare = 1;
+                if(compare && (w & 0xfe00) == 0xd000) reject = 1;
+                if((w & 0xfd00) == 0xb100 && !(w & 0x800)) reject = 1;
+            }
+            if(!length || !reject || call == SIZE_MAX || namespace_count == 8) return -1;
+            namespace_calls[namespace_count++] = call;
+        }
+        if(namespace_count - before > (h == 1 ? 1u : 2u)) return -1;
+    }
+    if(system != SIZE_MAX && namespace_count == 0) {
+        size_t pos = 0;
+        for(;;) {
+            size_t slot;unsigned reg;
+            size_t x = ref(img, system, pos, &reg, &slot);
+            if(x == SIZE_MAX) break;
+            pos = x + 2;
+            size_t f = function_start(img, x);
+            /* Shared helper computes strcmp(...) == 0 as a boolean. */
+            static const uint16_t tail[] = {0x1c03,0x3801,0x4398,0x0fc0,0xbd80};
+            if(reg != 1 || f == SIZE_MAX || x != f + 4 || rd16(img, x + 2) != 0x2211 ||
+               !is_bl(img, x + 4) || x + 18 > img->len) continue;
+            int valid = 1;
+            for(size_t j = 0; j < sizeof(tail)/sizeof(tail[0]); j++)
+                if(rd16(img, x + 8 + j*2) != tail[j]) valid = 0;
+            unsigned callers = 0;
+            for(size_t h = 0; h < 2; h++) {
+                size_t end = handlers[h] + 0x180;
+                if(end > img->len) end = img->len;
+                for(size_t q = handlers[h]; q + 4 <= end; q += width(rd16(img, q)))
+                    if(bl_target(img, q) == f) callers |= 1u << h;
+            }
+            if(!valid || callers != 3 || count) return -1;
+            funcs[count++] = f;
+        }
+        if(!count) return -1;
+    } else if(system != SIZE_MAX && namespace_count < 2) return -1;
+    size_t debug = find_string(img, "debug-uarts");
+    for(size_t p = 0; debug != SIZE_MAX && p + 4 <= img->len; p += 4) {
+        if(rd32(img, p) != img->base + debug) continue;
+        size_t start = p, end = p;
+        while(start >= 4 && p - start < 256 && arm32_nvram_string_pointer(img, start - 4)) start -= 4;
+        unsigned entries = 0;
+        int bootargs = 0;
+        end = start;
+        while(end + 4 <= img->len && end - start < 256 && arm32_nvram_string_pointer(img, end)) {
+            size_t s = rd32(img, end) - img->base;
+            bootargs |= !strcmp((const char*)img->buf + s, "boot-args");
+            end += 4; entries++;
+        }
+        if(!bootargs || entries < 3 || end + 4 > img->len || rd32(img, end)) continue;
+        size_t pos = 0, owners = 0;
+        for(;;) {
+            size_t slot; unsigned reg;
+            size_t x = ref(img, start, pos, &reg, &slot);
+            if(x == SIZE_MAX) break;
+            pos = x + 2;
+            size_t f = function_start(img, x);
+            if(f == SIZE_MAX) continue;
+            owners++;
+            int duplicate = 0;
+            for(size_t j = 0; j < count; j++) duplicate |= funcs[j] == f;
+            if(duplicate) continue;
+            if(count == 4) return -1;
+            funcs[count++] = f;
+        }
+        if(!owners) return -1;
+    }
+    if(!namespace_count && !count) {
+        if(img->VERS >= 900) return -1;
+        LOG("ARM32 console has no protected NVRAM policy; unlock not applicable\n");
+        return 0;
+    }
+    for(size_t j = 0; j < namespace_count; j++) {
+        wr16(img, namespace_calls[j], 0x2001);
+        wr16(img, namespace_calls[j] + 2, 0x2001);
+        LOG("Unlocked ARM32 NVRAM namespace call at 0x%zx\n", namespace_calls[j]);
+    }
+    for(size_t j = 0; j < count; j++) {
+        wr16(img, funcs[j], 0x2000);
+        wr16(img, funcs[j] + 2, 0x4770);
+        LOG("Unlocked ARM32 NVRAM policy at 0x%zx\n", funcs[j]);
+    }
+    return 0;
 }
 
 static size_t cb_target(const struct iboot64_img* img, size_t p) {

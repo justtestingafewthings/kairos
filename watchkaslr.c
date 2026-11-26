@@ -1,5 +1,6 @@
 /* Thumb kernel-slide discovery, GPL-3.0-or-later. Preserve load alignment. */
 #include "watchkaslr.h"
+#include "compat.h"
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>

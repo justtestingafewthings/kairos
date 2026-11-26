@@ -21,6 +21,7 @@
 
 #define _GNU_SOURCE
 #include "newpatch.h"
+#include "compat.h"
 
 #ifdef _WIN32
 void *memmem(const void *haystack, size_t haystack_len, 

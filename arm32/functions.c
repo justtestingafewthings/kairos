@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdint.h>
 #include "include/functions.h"
+#include "compat.h"
 #include "include/patchers.h"
 #include "include/iBoot32Patcher.h"
 

@@ -532,7 +532,8 @@ static size_t a64_sigcheck_result(const struct iboot64_img* image,
 	return selected;
 }
 
-static size_t a64_sigcheck_getter(const struct iboot64_img* image, size_t start) {
+static size_t a64_sigcheck_getter(const struct iboot64_img* image, size_t start,
+	unsigned* pointer_register) {
 	if(start > image->len || image->len - start < 24)
 		return 0;
 	if((a64_word(image, start) & 0xffc003e0) == 0xa9400020) {
@@ -562,6 +563,7 @@ static size_t a64_sigcheck_getter(const struct iboot64_img* image, size_t start)
 			select != (0x9a9f1000 | (context << 5)) ||
 			a64_word(image, start + 36) != 0xd65f03c0)
 			return 0;
+		*pointer_register = context;
 		return start + 32;
 	}
 	uint32_t load = a64_word(image, start), flag = a64_word(image, start + 4);
@@ -580,11 +582,13 @@ static size_t a64_sigcheck_getter(const struct iboot64_img* image, size_t start)
 	unsigned first = (select >> 5) & 31, second = (select >> 16) & 31;
 	if(!((first == pointer && second == 31) || (first == 31 && second == pointer)))
 		return 0;
-	return start + 16; // Preserve the context reads, replace only the selected result.
+	*pointer_register = pointer;
+	return start + 16; // Preserve the context reads, return the property pointer.
 }
 
 static int a64_sigcheck(struct iboot64_img* image) {
 	size_t selected = 0, selected_getter = 0;
+	unsigned selected_getter_register = 0;
 	for(size_t p = 0x340; p + 4 <= image->len; p += 4) {
 		unsigned reg;
 		size_t table, width;
@@ -630,23 +634,27 @@ static int a64_sigcheck(struct iboot64_img* image) {
 		if(!stack_context || !call)
 			continue;
 		size_t result = a64_sigcheck_result(image, callback, end);
-		size_t getter = a64_sigcheck_getter(image, end);
+		unsigned getter_register = 0;
+		size_t getter = a64_sigcheck_getter(image, end, &getter_register);
 		if(!result || !getter)
 			continue;
-		if(selected && (selected != result || selected_getter != getter)) {
+		if(selected && (selected != result || selected_getter != getter ||
+			selected_getter_register != getter_register)) {
 			WARN("Ambiguous ARM64 IMG4 property callback\n");
 			return -1;
 		}
 		selected = result;
 		selected_getter = getter;
+		selected_getter_register = getter_register;
 	}
 	if(!selected) {
 		WARN("Could not validate ARM64 IMG4 property callback\n");
 		return -1;
 	}
 	write_opcode(image->buf, selected, 0xd2800000); // MOV X0,#0
-	write_opcode(image->buf, selected_getter, 0xd2800000); // MOV X0,#0
-	LOG("Patched ARM64 IMG4 callback result at 0x%zx and getter result at 0x%zx\n",
+	write_opcode(image->buf, selected_getter,
+		0xaa0003e0 | (selected_getter_register << 16)); // MOV X0,property pointer
+	LOG("Patched ARM64 IMG4 callback result at 0x%zx and getter pointer at 0x%zx\n",
 		selected, selected_getter);
 	return 0;
 }

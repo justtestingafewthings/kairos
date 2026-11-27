@@ -637,12 +637,19 @@ int arm32_nvram_patch(struct iboot64_img* img) {
             pos = x + 2;
             size_t f = function_start(img, x);
             /* Shared helper computes strcmp(...) == 0 as a boolean. */
-            static const uint16_t tail[] = {0x1c03,0x3801,0x4398,0x0fc0,0xbd80};
+            static const uint16_t tails[][5] = {
+                {0x1c03,0x3801,0x4398,0x0fc0,0xbd80},
+                {0xf1d0,0x0001,0xbf38,0x2000,0xbd80},
+            };
             if(reg != 1 || f == SIZE_MAX || x != f + 4 || rd16(img, x + 2) != 0x2211 ||
                !is_bl(img, x + 4) || x + 18 > img->len) continue;
-            int valid = 1;
-            for(size_t j = 0; j < sizeof(tail)/sizeof(tail[0]); j++)
-                if(rd16(img, x + 8 + j*2) != tail[j]) valid = 0;
+            int valid = 0;
+            for(size_t variant = 0; variant < sizeof(tails)/sizeof(tails[0]); variant++) {
+                int match = 1;
+                for(size_t j = 0; j < sizeof(tails[0])/sizeof(tails[0][0]); j++)
+                    if(rd16(img, x + 8 + j*2) != tails[variant][j]) match = 0;
+                valid |= match;
+            }
             unsigned callers = 0;
             for(size_t h = 0; h < 2; h++) {
                 size_t end = handlers[h] + 0x180;
